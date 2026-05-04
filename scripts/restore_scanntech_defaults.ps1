@@ -37,14 +37,29 @@ cur.execute(
     (content, int(time.time()), 'Scanntech Analyst'),
 )
 
-cur.execute(
-    \"SELECT id, chat FROM chat WHERE chat IS NOT NULL ORDER BY updated_at DESC LIMIT 1\"
-)
-row = cur.fetchone()
-if row:
-    chat_id, chat_json = row
-    payload = json.loads(chat_json)
+def normalize_chat_models(payload):
     payload['models'] = ['Scanntech Analyst']
+    history = payload.get('history', {})
+    messages = history.get('messages', {})
+    for message in messages.values():
+        if isinstance(message, dict):
+            if message.get('model') == 'qwen2.5:latest':
+                message['model'] = 'Scanntech Analyst'
+            if message.get('models') == ['qwen2.5:latest']:
+                message['models'] = ['Scanntech Analyst']
+    for message in payload.get('messages', []):
+        if isinstance(message, dict):
+            if message.get('model') == 'qwen2.5:latest':
+                message['model'] = 'Scanntech Analyst'
+            if message.get('models') == ['qwen2.5:latest']:
+                message['models'] = ['Scanntech Analyst']
+    return payload
+
+cur.execute(\"SELECT id, chat FROM chat WHERE chat IS NOT NULL\")
+rows = cur.fetchall()
+for chat_id, chat_json in rows:
+    payload = json.loads(chat_json)
+    payload = normalize_chat_models(payload)
     cur.execute(
         \"UPDATE chat SET chat = ?, updated_at = ? WHERE id = ?\",
         (json.dumps(payload, ensure_ascii=False), int(time.time()), chat_id),
