@@ -54,7 +54,8 @@ services:
       - WEBUI_SECRET_KEY=aquafast_secret_2026   # troque por uma chave segura
       - WEBUI_NAME=Aquafast IA                  # nome que aparece na interface
       # Padrão de trabalho do projeto: manter Scanntech Analyst como porta de entrada.
-      - DEFAULT_MODELS=scanntech_analyst        # nao alterar sem atualizar a documentacao
+      # Observacao: para Pipes/Functions, o Open WebUI usa o id completo "<function_id>.<pipe_id>".
+      - DEFAULT_MODELS=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
       - ENABLE_SIGNUP=true                      # permite o primeiro cadastro
       - DEFAULT_USER_ROLE=user
     depends_on:
