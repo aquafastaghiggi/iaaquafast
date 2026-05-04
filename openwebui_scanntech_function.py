@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.11
+version: 3.0.12
 requirements: httpx
 """
 
@@ -156,6 +156,35 @@ class Pipe:
     def _contains_any(self, text: str, terms: list[str]) -> bool:
         return any(term in text for term in terms)
 
+    def _looks_like_edit_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        edit_verbs = [
+            "melhore",
+            "revise",
+            "reescreva",
+            "corrija",
+            "ajuste",
+            "traduza",
+            "resuma",
+            "explique",
+        ]
+        edit_objects = [
+            "texto",
+            "mensagem",
+            "email",
+            "e-mail",
+            "paragrafo",
+            "parágrafo",
+            "frase",
+            "prompt",
+            "documento",
+            "relatorio",
+            "relatório",
+        ]
+        if any(re.search(rf"\\b{re.escape(v)}\\b", q) for v in edit_verbs) and self._contains_any(q, edit_objects):
+            return True
+        return False
+
     def _is_explicit_chat_question(self, question: str) -> bool:
         q = self._normalize_text(question)
 
@@ -166,7 +195,6 @@ class Pipe:
             "resuma",
             "escreva",
             "revise",
-            "melhore",
             "ajude",
             "o que e",
             "quem e voce",
@@ -196,7 +224,10 @@ class Pipe:
             r"^\s*(oi|ol[aá]|bom dia|boa tarde|boa noite|obrigado|valeu)\s*[!?.,]*\s*$",
         ]
 
-        if self._contains_any(q, chat_terms):
+        # evita falso positivo de substring (ex.: "melhores" vs "melhore")
+        if self._contains_any(q, chat_terms) and not self._looks_like_data_question(q):
+            return True
+        if self._looks_like_edit_request(q):
             return True
 
         return any(re.search(pattern, q) for pattern in chat_patterns)
@@ -238,6 +269,7 @@ class Pipe:
             "menor",
             "menores",
             "melhor",
+            "melhores",
             "piores",
             "lista",
             "listar",
