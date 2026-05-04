@@ -88,6 +88,18 @@ python ingest_scanntech.py --arquivo C:\caminho\scanntech.csv --preview-only
 python ingest_scanntech.py --arquivo C:\caminho\scanntech.csv
 ```
 
+### Caso Scanntech venha em 3 arquivos (Clientes + Produtos + PDV)
+
+Se você recebeu arquivos separados (dimensões + PDV), use este modo. Ele importa os 3 arquivos e cria a tabela final `scanntech` já cruzada, mantendo o chat e as views funcionando igual.
+
+```bash
+# Preview (não importa)
+python ingest_scanntech.py --pdv C:\caminho\pdv.csv --clientes C:\caminho\clientes.csv --produtos C:\caminho\produtos.csv --preview-only
+
+# Importação completa
+python ingest_scanntech.py --pdv C:\caminho\pdv.csv --clientes C:\caminho\clientes.csv --produtos C:\caminho\produtos.csv
+```
+
 O script vai:
 1. Detectar encoding e separador automaticamente
 2. Mostrar preview das primeiras linhas

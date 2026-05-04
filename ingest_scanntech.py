@@ -61,6 +61,43 @@ COLUNAS_ESSENCIAIS = {
     "data": ["DATA_VENDA", "DATA", "DT_VENDA"],
 }
 
+# ----------------------------------------------------------
+#  MODO 3 ARQUIVOS (PDV + dimensoes)
+# ----------------------------------------------------------
+CLIENTES_KEYS = ["CNPJ", "COD_CLI", "COD_CLIENTE", "ID_CLIENTE", "CLIENTE_ID", "CODIGO_CLIENTE", "CNPJ_CLIENTE"]
+CLIENTES_NAME_COLS = ["RAZAO_SOCIAL", "RAZAO", "NOME_CLIENTE", "CLIENTE", "NOME_FANTASIA"]
+PRODUTOS_KEYS = ["COD_PRODUTO", "SKU", "CODIGO_PRODUTO", "ID_PRODUTO", "PRODUTO_ID", "COD_PROD"]
+PRODUTOS_NAME_COLS = ["DESC_PRODUTO", "DESCRICAO", "DESCR", "PRODUTO", "NOME_PRODUTO"]
+
+
+def _upper_map(colunas: list[str]) -> dict[str, str]:
+    return {str(c).upper().strip(): str(c) for c in colunas}
+
+
+def _pick_column(colunas: list[str], candidates: list[str]) -> str | None:
+    """Encontra uma coluna por substring (case-insensitive)."""
+    upper = _upper_map(colunas)
+    for cand in candidates:
+        cand_up = cand.upper()
+        for key, original in upper.items():
+            if cand_up == key or cand_up in key:
+                return original
+    return None
+
+
+def _pick_required(colunas: list[str], label: str, candidates: list[str]) -> str:
+    col = _pick_column(colunas, candidates)
+    if not col:
+        raise ValueError(
+            f"Nao encontrei coluna obrigatoria ({label}). "
+            f"Candidatos: {candidates}. Colunas: {colunas}"
+        )
+    return col
+
+
+def _safe_relpath(path: str) -> str:
+    return path.replace(chr(92), "/")
+
 
 def detectar_separador(arquivo: str, encoding: str) -> str:
     """Detecta automaticamente o separador do CSV."""
@@ -101,13 +138,14 @@ def detectar_encoding(arquivo: str) -> str:
 def escolher_coluna_cliente(colunas: list) -> str | None:
     """
     Escolhe a melhor coluna para identificar o cliente.
-    Prioriza a razão social para exibição e deixa CNPJ como fallback.
+    Prioriza a razão social para exibição legível.
     """
     prioridades = [
         "RAZAO_SOCIAL",
         "RAZAO",
         "CLIENTE",
         "NOME_CLIENTE",
+        "NOME_FANTASIA",
         "COD_CLI",
         "CNPJ",
     ]
@@ -163,6 +201,201 @@ def preview_arquivo(arquivo: str, encoding: str, separador: str, n_linhas: int =
     console.print(f"[dim]Colunas encontradas: {list(df_preview.columns)}[/dim]")
     
     return df_preview.columns.tolist()
+
+
+def preview_arquivo_duckdb(arquivo: str, encoding: str, separador: str, n_linhas: int = 5) -> list[str]:
+    """Preview usando DuckDB (evita pandas e funciona bem em arquivos grandes)."""
+    con = duckdb.connect(":memory:")
+    try:
+        rel = con.execute(
+            f"""
+            SELECT * FROM read_csv_auto(
+                '{_safe_relpath(arquivo)}',
+                delim='{separador}',
+                header=true,
+                ignore_errors=true,
+                sample_size=20000,
+                encoding='{encoding}'
+            ) LIMIT {int(n_linhas)}
+            """
+        )
+        cols = [d[0] for d in rel.description]
+        rows = rel.fetchall()
+    finally:
+        con.close()
+
+    console.print("\n[bold cyan]Preview do arquivo:[/bold cyan]")
+    table = Table(show_header=True, header_style="bold blue")
+    for col in cols[:10]:
+        table.add_column(str(col)[:20], overflow="fold")
+    for row in rows:
+        table.add_row(*[str(v)[:20] for v in row[:10]])
+    console.print(table)
+    console.print(f"[dim]Colunas encontradas: {cols}[/dim]")
+    return cols
+
+
+def importar_csv_duckdb(
+    con: duckdb.DuckDBPyConnection,
+    tabela: str,
+    arquivo: str,
+    encoding: str,
+    separador: str,
+) -> list[str]:
+    """Importa um CSV grande diretamente via DuckDB em streaming e retorna as colunas detectadas."""
+    console.print(f"[yellow]Importando {tabela}...[/yellow] {arquivo}")
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE "{tabela}" AS
+        SELECT * FROM read_csv_auto(
+            '{_safe_relpath(arquivo)}',
+            delim='{separador}',
+            header=true,
+            ignore_errors=true,
+            sample_size=-1,
+            encoding='{encoding}'
+        )
+        """
+    )
+    cols = [r[0] for r in con.execute(f'DESCRIBE "{tabela}"').fetchall()]
+    total = con.execute(f'SELECT COUNT(*) FROM "{tabela}"').fetchone()[0]
+    console.print(f"[green]✓[/green] {tabela}: {total:,} linhas")
+    return cols
+
+
+def importar_3_arquivos_para_duckdb(
+    pdv: str,
+    clientes: str,
+    produtos: str,
+    db_path: str,
+    preview_only: bool = False,
+):
+    """
+    Importa 3 arquivos (PDV + dimensoes clientes e produtos) e gera a tabela final `scanntech`
+    no formato esperado pela stack.
+    """
+    if not os.path.exists(pdv):
+        raise FileNotFoundError(f"Arquivo PDV nao encontrado: {pdv}")
+    if not os.path.exists(clientes):
+        raise FileNotFoundError(f"Arquivo clientes nao encontrado: {clientes}")
+    if not os.path.exists(produtos):
+        raise FileNotFoundError(f"Arquivo produtos nao encontrado: {produtos}")
+
+    console.print("\n[bold]🚀 Aquafast — Ingestor Scanntech (3 arquivos)[/bold]")
+    console.print(f"PDV:      [cyan]{pdv}[/cyan]")
+    console.print(f"Clientes: [cyan]{clientes}[/cyan]")
+    console.print(f"Produtos: [cyan]{produtos}[/cyan]")
+
+    enc_pdv = detectar_encoding(pdv)
+    sep_pdv = detectar_separador(pdv, enc_pdv)
+    enc_cli = detectar_encoding(clientes)
+    sep_cli = detectar_separador(clientes, enc_cli)
+    enc_pro = detectar_encoding(produtos)
+    sep_pro = detectar_separador(produtos, enc_pro)
+
+    cols_pdv = preview_arquivo_duckdb(pdv, enc_pdv, sep_pdv)
+    cols_cli = preview_arquivo_duckdb(clientes, enc_cli, sep_cli)
+    cols_pro = preview_arquivo_duckdb(produtos, enc_pro, sep_pro)
+
+    # valida o minimo das dimensoes
+    _pick_required(cols_cli, "chave de cliente (clientes)", CLIENTES_KEYS)
+    _pick_required(cols_cli, "nome do cliente (clientes)", CLIENTES_NAME_COLS)
+    _pick_required(cols_pro, "chave de produto (produtos)", PRODUTOS_KEYS)
+    _pick_required(cols_pro, "nome do produto (produtos)", PRODUTOS_NAME_COLS)
+
+    if preview_only:
+        console.print("\n[yellow]Modo preview — importacao nao realizada.[/yellow]")
+        return None
+
+    console.print("\n[bold yellow]Confirma importacao dos 3 arquivos para DuckDB?[/bold yellow]")
+    resp = input("Digite 's' para continuar: ").strip().lower()
+    if resp != "s":
+        console.print("Cancelado.")
+        return None
+
+    con = duckdb.connect(db_path)
+    try:
+        try:
+            con.execute("PRAGMA threads=4")
+        except Exception:
+            pass
+
+        cols_cli_real = importar_csv_duckdb(con, "scanntech_clientes_raw", clientes, enc_cli, sep_cli)
+        cols_pro_real = importar_csv_duckdb(con, "scanntech_produtos_raw", produtos, enc_pro, sep_pro)
+        cols_pdv_real = importar_csv_duckdb(con, "scanntech_pdv_raw", pdv, enc_pdv, sep_pdv)
+
+        cli_key = _pick_required(cols_cli_real, "chave de cliente (clientes)", CLIENTES_KEYS)
+        cli_name = _pick_required(cols_cli_real, "nome do cliente (clientes)", CLIENTES_NAME_COLS)
+        pro_key = _pick_required(cols_pro_real, "chave de produto (produtos)", PRODUTOS_KEYS)
+        pro_name = _pick_required(cols_pro_real, "nome do produto (produtos)", PRODUTOS_NAME_COLS)
+
+        pdv_cli_key = _pick_required(cols_pdv_real, "chave de cliente (pdv)", CLIENTES_KEYS)
+        pdv_pro_key = _pick_required(cols_pdv_real, "chave de produto (pdv)", PRODUTOS_KEYS)
+
+        pdv_qtd = _pick_required(cols_pdv_real, "quantidade (pdv)", ["QTD", "QTDE", "QUANTIDADE", "QTD_ITEM", "QTD_VENDA"])
+        pdv_valor_total = _pick_required(cols_pdv_real, "valor total (pdv)", ["VALOR_TOTAL", "VALOR", "TOTAL", "VL_TOTAL", "VLR_TOTAL"])
+        pdv_valor_unit = _pick_column(cols_pdv_real, ["VALOR_UNITARIO", "VL_UNIT", "VLR_UNIT", "PRECO_UNIT", "PRECO_UNITARIO"])
+        pdv_data = _pick_required(cols_pdv_real, "data (pdv)", ["DATA_VENDA", "DATA", "DT_VENDA", "DATA_EMISSAO", "DT_EMISSAO"])
+        pdv_uf = _pick_column(cols_pdv_real, ["UF", "ESTADO"])
+        pdv_cidade = _pick_column(cols_pdv_real, ["CIDADE", "MUNICIPIO", "MUNICÍPIO"])
+        pdv_canal = _pick_column(cols_pdv_real, ["CANAL", "TIPO_CANAL", "SEGMENTO"])
+
+        console.print("\n[bold]Mapeamento detectado:[/bold]")
+        console.print(f"[dim]Clientes: key={cli_key} nome={cli_name}[/dim]")
+        console.print(f"[dim]Produtos: key={pro_key} nome={pro_name}[/dim]")
+        console.print(f"[dim]PDV: cli_key={pdv_cli_key} pro_key={pdv_pro_key}[/dim]")
+
+        select_cols = [
+            f'CAST(p."{pdv_cli_key}" AS BIGINT) AS CNPJ',
+            f'CAST(c."{cli_name}" AS VARCHAR) AS RAZAO_SOCIAL',
+            f'CAST(p."{pdv_pro_key}" AS VARCHAR) AS COD_PRODUTO',
+            f'CAST(pr."{pro_name}" AS VARCHAR) AS DESC_PRODUTO',
+            f'CAST(p."{pdv_qtd}" AS BIGINT) AS QTD',
+        ]
+        if pdv_valor_unit:
+            select_cols.append(f'CAST(p."{pdv_valor_unit}" AS DOUBLE) AS VALOR_UNITARIO')
+        else:
+            select_cols.append("NULL::DOUBLE AS VALOR_UNITARIO")
+        select_cols.append(f'CAST(p."{pdv_valor_total}" AS DOUBLE) AS VALOR_TOTAL')
+        select_cols.append(f'CAST(p."{pdv_data}" AS DATE) AS DATA_VENDA')
+        if pdv_uf:
+            select_cols.append(f'CAST(p."{pdv_uf}" AS VARCHAR) AS UF')
+        else:
+            select_cols.append("NULL::VARCHAR AS UF")
+        if pdv_cidade:
+            select_cols.append(f'CAST(p."{pdv_cidade}" AS VARCHAR) AS CIDADE')
+        else:
+            select_cols.append("NULL::VARCHAR AS CIDADE")
+        if pdv_canal:
+            select_cols.append(f'CAST(p."{pdv_canal}" AS VARCHAR) AS CANAL')
+        else:
+            select_cols.append("NULL::VARCHAR AS CANAL")
+
+        console.print("\n[yellow]Gerando tabela final scanntech (join PDV + dimensoes)...[/yellow]")
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE scanntech AS
+            SELECT
+                {",\n                ".join(select_cols)}
+            FROM scanntech_pdv_raw p
+            LEFT JOIN scanntech_clientes_raw c
+                ON CAST(p."{pdv_cli_key}" AS VARCHAR) = CAST(c."{cli_key}" AS VARCHAR)
+            LEFT JOIN scanntech_produtos_raw pr
+                ON CAST(p."{pdv_pro_key}" AS VARCHAR) = CAST(pr."{pro_key}" AS VARCHAR)
+            """
+        )
+
+        total_final = con.execute("SELECT COUNT(*) FROM scanntech").fetchone()[0]
+        console.print(f"[green]✓[/green] scanntech: {total_final:,} linhas")
+
+        colunas_final = [r[0] for r in con.execute("DESCRIBE scanntech").fetchall()]
+        criar_indices(con, colunas_final)
+        relatorio_qualidade(con, total_final, colunas_final)
+        exportar_views_csv(con)
+        exportar_config_metabase(db_path)
+    finally:
+        con.close()
+    return True
 
 
 def importar_para_duckdb(arquivo: str, encoding: str, separador: str, db_path: str):
@@ -240,7 +473,16 @@ def criar_indices(con: duckdb.DuckDBPyConnection, colunas: list):
     
     col_data = next((c for c in colunas if any(k in c.lower() for k in ["data", "date", "dt_", "_dt"])), None)
     col_cliente = escolher_coluna_cliente(colunas)
-    col_valor = next((c for c in colunas if any(k in c.lower() for k in ["valor", "total", "vl_", "_vl", "preco"])), None)
+    
+    # Prioriza VALOR_TOTAL > VALOR_LIQUIDO > VALOR_UNITARIO > TOTAL
+    col_valor = None
+    for prioridade in ["valor_total", "valor_liquido", "total", "valor", "vl_total", "vl_", "_vl", "preco"]:
+        col_valor = next((c for c in colunas if prioridade in c.lower()), None)
+        if col_valor:
+            break
+    if not col_valor:
+        col_valor = next((c for c in colunas if any(k in c.lower() for k in ["valor", "total", "vl_", "_vl", "preco"])), None)
+    
     col_produto = next((c for c in colunas if any(k in c.lower() for k in ["produto", "sku", "cod_prod", "descricao"])), None)
     
     console.print(f"[dim]Coluna de data: {col_data}[/dim]")
@@ -257,7 +499,7 @@ def criar_indices(con: duckdb.DuckDBPyConnection, colunas: list):
                     COALESCE(NULLIF(TRIM(CAST("{col_cliente}" AS VARCHAR)), ''), 'NAO_INFORMADO') as cliente,
                     COUNT(*) as total_pedidos,
                     ROUND(SUM(TRY_CAST("{col_valor}" AS DOUBLE)), 2) as valor_total,
-                    ROUND(AVG(TRY_CAST("{col_valor}" AS DOUBLE)), 2) as ticket_medio,
+                    ROUND(SUM(TRY_CAST("{col_valor}" AS DOUBLE)) / COUNT(*), 2) as ticket_medio,
                     MIN("{col_data}") as primeira_compra,
                     MAX("{col_data}") as ultima_compra
                 FROM scanntech
@@ -423,10 +665,32 @@ def exportar_views_csv(con: duckdb.DuckDBPyConnection):
 
 def main():
     parser = argparse.ArgumentParser(description="Ingestor Scanntech → DuckDB")
-    parser.add_argument("--arquivo", required=True, help="Caminho para o CSV/TXT da Scanntech")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--arquivo", help="Caminho para o CSV/TXT unico da Scanntech (ja denormalizado)")
+    group.add_argument("--pdv", help="Caminho para o arquivo de vendas PDV (fato)")
+    parser.add_argument("--clientes", help="Caminho para o arquivo de clientes (dimensao)")
+    parser.add_argument("--produtos", help="Caminho para o arquivo de produtos (dimensao)")
     parser.add_argument("--db", default=DB_PATH, help=f"Caminho do banco DuckDB (padrão: {DB_PATH})")
     parser.add_argument("--preview-only", action="store_true", help="Só mostra preview, não importa")
     args = parser.parse_args()
+
+    # Modo 3 arquivos
+    if args.pdv:
+        if not args.clientes or not args.produtos:
+            console.print("[red]Para usar --pdv, voce precisa passar --clientes e --produtos.[/red]")
+            sys.exit(1)
+        try:
+            importar_3_arquivos_para_duckdb(
+                args.pdv,
+                args.clientes,
+                args.produtos,
+                args.db,
+                preview_only=args.preview_only,
+            )
+        except Exception as e:
+            console.print(f"[red]Erro: {e}[/red]")
+            sys.exit(1)
+        return
     
     if not os.path.exists(args.arquivo):
         console.print(f"[red]Arquivo não encontrado: {args.arquivo}[/red]")
