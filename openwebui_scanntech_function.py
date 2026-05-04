@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.0
+version: 3.0.1
 requirements: httpx
 """
 
@@ -17,6 +17,9 @@ from pydantic import BaseModel, Field
 
 
 class Pipe:
+    # Invariante do projeto:
+    # - O nome visivel e a porta de entrada principal precisam permanecer como "Scanntech Analyst".
+    # - O modelo interno continua sendo qwen2.5:latest, mas so para raciocinio e resposta.
     class Valves(BaseModel):
         API_BASE_URL: str = Field(
             default="http://scanntech-api:8000",
@@ -636,4 +639,3 @@ class Pipe:
                 f"_Linhas retornadas: {result.get('row_count', 0)}_",
             ]
         )
-

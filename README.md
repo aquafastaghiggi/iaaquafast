@@ -118,6 +118,21 @@ Na primeira vez:
 Ele usa o `qwen2.5` para conversa livre e consulta o DuckDB local via `Scanntech API` quando a pergunta pede dados.
 Se a pergunta não for suportada, ele responde isso explicitamente em vez de inventar.
 
+### Padrao do projeto
+
+Este projeto tem um contrato operacional fixo:
+- O modelo principal visivel no chat deve ser `Scanntech Analyst`.
+- O `qwen2.5` fica apenas como motor interno.
+- Mudancas em qualquer outra parte nao devem alterar esse padrao.
+
+Se o Open WebUI perder essa configuracao, restaure com:
+
+```powershell
+.\scripts\restore_scanntech_defaults.ps1
+```
+
+O detalhe completo esta em [docs/scanntech-default-contract.md](docs/scanntech-default-contract.md).
+
 ### Como saber que a IA está funcionando
 
 - Se você pedir algo analítico, o número vem do DuckDB.
