@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.9
+version: 3.0.10
 requirements: httpx
 """
 
@@ -75,15 +75,30 @@ class Pipe:
         ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
         return " ".join(ascii_text.lower().split())
 
+    def _content_to_text(self, content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")).strip())
+            return "\n".join(part for part in parts if part).strip()
+        return str(content).strip()
+
     def _extract_question(self, body: dict) -> str:
         messages = body.get("messages", [])
         for message in reversed(messages):
             if message.get("role") != "user":
                 continue
-            content = str(message.get("content", "")).strip()
+            content = self._content_to_text(message.get("content", ""))
             if content:
                 return content
-        return str(body.get("prompt", "")).strip()
+        return self._content_to_text(body.get("prompt", ""))
 
     def _combined_user_text(self, body: dict) -> str:
         messages = body.get("messages", [])
@@ -91,7 +106,7 @@ class Pipe:
         for message in messages:
             if message.get("role") != "user":
                 continue
-            content = str(message.get("content", "")).strip()
+            content = self._content_to_text(message.get("content", ""))
             if content:
                 parts.append(content)
         return "\n".join(parts).strip()
@@ -289,7 +304,7 @@ class Pipe:
         for message in reversed(messages[:-1]):
             if message.get("role") != "assistant":
                 continue
-            content = str(message.get("content", ""))
+            content = self._content_to_text(message.get("content", ""))
             match = re.search(r"Consulta executada:\s*`([^`]+)`", content)
             if match:
                 return match.group(1).strip().rstrip(";")
@@ -300,7 +315,7 @@ class Pipe:
         for message in reversed(messages[:-1]):
             if message.get("role") != "assistant":
                 continue
-            content = str(message.get("content", ""))
+            content = self._content_to_text(message.get("content", ""))
             # Find the last markdown table in the assistant response.
             lines = [line.rstrip() for line in content.splitlines()]
             for idx in range(len(lines) - 2):
@@ -541,7 +556,7 @@ class Pipe:
             role = message.get("role")
             if role not in {"user", "assistant"}:
                 continue
-            content = str(message.get("content", "")).strip()
+            content = self._content_to_text(message.get("content", ""))
             if not content:
                 continue
             # evita mandar tabelas gigantes pro modelo
