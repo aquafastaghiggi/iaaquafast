@@ -386,6 +386,142 @@ class Pipe:
         q = self._normalize_text(question)
         return any(term in q for term in ["cidade", "cidades", "municipio", "município", "uf", "estado"])
 
+    def _looks_like_product_name_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        # _normalize_text remove acentos, entao "descrição" vira "descricao"
+        return any(term in q for term in ["nome", "descricao", "desc_produto", "descr"])
+
+    def _looks_like_ticket_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(term in q for term in ["ticket", "ticket medio", "preco medio", "valor medio"])
+
+    def _looks_like_last_sale_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(
+            term in q
+            for term in [
+                "ultimo valor",
+                "ultima venda",
+                "ultimo preco",
+                "preco praticado",
+                "valor praticado",
+            ]
+        )
+
+    def _extract_product_codes(self, body: dict, question: str | None = None) -> list[str]:
+        """
+        Descobre codigos de produto a partir do ultimo resultado (tabela markdown)
+        e, se necessario, do texto da pergunta.
+        """
+        codes: list[str] = []
+
+        last_table = self._find_last_table(body)
+        if last_table:
+            cols, rows = last_table
+            lower = [c.lower() for c in cols]
+            pick = None
+            for key in ["codigo", "cod_produto", "cod produto", "produto", "sku"]:
+                for i, c in enumerate(lower):
+                    if key == c or key in c:
+                        pick = i
+                        break
+                if pick is not None:
+                    break
+            if pick is not None:
+                for r in rows:
+                    if not r or len(r) <= pick:
+                        continue
+                    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(r[pick]))
+                    if cleaned:
+                        codes.append(cleaned)
+
+        if not codes and question:
+            for match in re.findall(r"\b([A-Za-z]{2,}\d{1,}|sku\d+)\b", str(question), flags=re.IGNORECASE):
+                cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(match))
+                if cleaned:
+                    codes.append(cleaned)
+
+        seen = set()
+        unique: list[str] = []
+        for c in codes:
+            if c in seen:
+                continue
+            seen.add(c)
+            unique.append(c)
+        return unique[:50]
+
+    def _build_product_names_sql(self, products: list[str]) -> str:
+        safe = []
+        for item in products:
+            cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(item))
+            if cleaned:
+                safe.append(cleaned)
+        if not safe:
+            raise ValueError("Nao encontrei codigos de produto para buscar o nome.")
+        in_list = ", ".join(f"'{p}'" for p in safe[:50])
+        return (
+            "SELECT\n"
+            "  COD_PRODUTO AS codigo,\n"
+            "  MIN(DESC_PRODUTO) AS nome\n"
+            "FROM scanntech\n"
+            f"WHERE COD_PRODUTO IN ({in_list})\n"
+            "  AND NULLIF(TRIM(CAST(DESC_PRODUTO AS VARCHAR)), '') IS NOT NULL\n"
+            "GROUP BY COD_PRODUTO\n"
+            "ORDER BY codigo\n"
+        )
+
+    def _build_ticket_sql_for_products(self, products: list[str]) -> str:
+        safe = []
+        for item in products:
+            cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(item))
+            if cleaned:
+                safe.append(cleaned)
+        if not safe:
+            raise ValueError("Nao encontrei codigos de produto para calcular ticket medio.")
+        in_list = ", ".join(f"'{p}'" for p in safe[:50])
+        return (
+            "SELECT\n"
+            "  COD_PRODUTO AS codigo,\n"
+            "  MIN(DESC_PRODUTO) AS nome,\n"
+            "  ROUND(SUM(VALOR_TOTAL) / NULLIF(SUM(QTD), 0), 2) AS ticket_medio_unitario,\n"
+            "  ROUND(AVG(VALOR_UNITARIO), 2) AS preco_medio_unitario,\n"
+            "  SUM(QTD) AS qtd_total,\n"
+            "  ROUND(SUM(VALOR_TOTAL), 2) AS faturamento_total,\n"
+            "  MIN(DATA_VENDA) AS primeira_venda,\n"
+            "  MAX(DATA_VENDA) AS ultima_venda\n"
+            "FROM scanntech\n"
+            f"WHERE COD_PRODUTO IN ({in_list})\n"
+            "GROUP BY COD_PRODUTO\n"
+            "ORDER BY faturamento_total DESC NULLS LAST\n"
+        )
+
+    def _build_last_sale_sql_for_products(self, products: list[str]) -> str:
+        safe = []
+        for item in products:
+            cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(item))
+            if cleaned:
+                safe.append(cleaned)
+        if not safe:
+            raise ValueError("Nao encontrei codigos de produto para buscar o ultimo valor de venda.")
+        in_list = ", ".join(f"'{p}'" for p in safe[:50])
+        return (
+            "SELECT codigo, nome, data_venda, qtd, valor_unitario, valor_total\n"
+            "FROM (\n"
+            "  SELECT\n"
+            "    COD_PRODUTO AS codigo,\n"
+            "    DESC_PRODUTO AS nome,\n"
+            "    DATA_VENDA AS data_venda,\n"
+            "    QTD AS qtd,\n"
+            "    VALOR_UNITARIO AS valor_unitario,\n"
+            "    VALOR_TOTAL AS valor_total,\n"
+            "    ROW_NUMBER() OVER (PARTITION BY COD_PRODUTO ORDER BY DATA_VENDA DESC) AS rn\n"
+            "  FROM scanntech\n"
+            f"  WHERE COD_PRODUTO IN ({in_list})\n"
+            ")\n"
+            "WHERE rn = 1\n"
+            "ORDER BY data_venda DESC, codigo\n"
+        )
+
     def _build_clients_sql_for_months(self, months: list[str]) -> str:
         safe = []
         for m in months:
@@ -1058,6 +1194,26 @@ class Pipe:
                         clients = [r[pick_cliente] for r in rows if r and len(r) > pick_cliente]
                         sql = self._build_cities_sql_for_clients(clients)
                         return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+
+            # Follow-up de produto: nome / ticket medio / ultimo valor praticado.
+            # Fazemos de forma deterministica usando o ultimo resultado (para nao "inventar" produto).
+            if self._looks_like_product_name_question(routing_text):
+                products = self._extract_product_codes(body, routing_text)
+                if products:
+                    sql = self._build_product_names_sql(products)
+                    return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+
+            if self._looks_like_ticket_question(routing_text):
+                products = self._extract_product_codes(body, routing_text)
+                if products:
+                    sql = self._build_ticket_sql_for_products(products)
+                    return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+
+            if self._looks_like_last_sale_question(routing_text):
+                products = self._extract_product_codes(body, routing_text)
+                if products:
+                    sql = self._build_last_sale_sql_for_products(products)
+                    return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
 
             route = self._looks_like_data_question(routing_text)
             if route is False:
