@@ -53,6 +53,13 @@ COLUNAS_ESPERADAS = {
     "CIDADE"           : "cidade",
 }
 
+COLUNAS_ESSENCIAIS = {
+    "cliente": ["RAZAO_SOCIAL", "CLIENTE", "NOME_CLIENTE", "CNPJ"],
+    "produto": ["COD_PRODUTO", "SKU", "PRODUTO", "DESC_PRODUTO"],
+    "valor": ["VALOR_TOTAL", "VALOR", "PRECO"],
+    "data": ["DATA_VENDA", "DATA", "DT_VENDA"],
+}
+
 
 def detectar_separador(arquivo: str, encoding: str) -> str:
     """Detecta automaticamente o separador do CSV."""
@@ -112,6 +119,23 @@ def escolher_coluna_cliente(colunas: list) -> str | None:
                 return coluna_original
 
     return None
+
+
+def validar_colunas_essenciais(colunas: list) -> None:
+    """Garante que o arquivo tem o minimo necessario para analise."""
+    colunas_upper = [str(col).upper() for col in colunas]
+    faltando = []
+
+    for nome, candidatos in COLUNAS_ESSENCIAIS.items():
+        if not any(any(candidato in coluna for coluna in colunas_upper) for candidato in candidatos):
+            faltando.append(nome)
+
+    if faltando:
+        raise ValueError(
+            "Colunas essenciais ausentes ou nao identificadas: "
+            + ", ".join(faltando)
+            + ". Verifique cliente, produto, valor e data no CSV."
+        )
 
 
 def preview_arquivo(arquivo: str, encoding: str, separador: str, n_linhas: int = 5):
@@ -229,14 +253,14 @@ def criar_indices(con: duckdb.DuckDBPyConnection, colunas: list):
             con.execute(f"""
                 CREATE OR REPLACE VIEW ranking_clientes AS
                 SELECT 
-                    "{col_cliente}" as cliente,
+                    COALESCE(NULLIF(TRIM(CAST("{col_cliente}" AS VARCHAR)), ''), 'NAO_INFORMADO') as cliente,
                     COUNT(*) as total_pedidos,
                     ROUND(SUM(TRY_CAST("{col_valor}" AS DOUBLE)), 2) as valor_total,
                     ROUND(AVG(TRY_CAST("{col_valor}" AS DOUBLE)), 2) as ticket_medio,
                     MIN("{col_data}") as primeira_compra,
                     MAX("{col_data}") as ultima_compra
                 FROM scanntech
-                GROUP BY "{col_cliente}"
+                GROUP BY COALESCE(NULLIF(TRIM(CAST("{col_cliente}" AS VARCHAR)), ''), 'NAO_INFORMADO')
                 ORDER BY valor_total DESC NULLS LAST
             """)
             console.print("[green]✓[/green] View ranking_clientes criada")
@@ -249,11 +273,11 @@ def criar_indices(con: duckdb.DuckDBPyConnection, colunas: list):
             con.execute(f"""
                 CREATE OR REPLACE VIEW ranking_produtos AS
                 SELECT 
-                    "{col_produto}" as produto,
+                    COALESCE(NULLIF(TRIM(CAST("{col_produto}" AS VARCHAR)), ''), 'NAO_INFORMADO') as produto,
                     COUNT(*) as total_vendas,
                     ROUND(SUM(TRY_CAST("{col_valor}" AS DOUBLE)), 2) as receita_total
                 FROM scanntech
-                GROUP BY "{col_produto}"
+                GROUP BY COALESCE(NULLIF(TRIM(CAST("{col_produto}" AS VARCHAR)), ''), 'NAO_INFORMADO')
                 ORDER BY receita_total DESC NULLS LAST
             """)
             console.print("[green]✓[/green] View ranking_produtos criada")
@@ -379,6 +403,7 @@ def main():
     
     # 2. Preview
     colunas = preview_arquivo(args.arquivo, encoding, separador)
+    validar_colunas_essenciais(colunas)
     
     if args.preview_only:
         console.print("\n[yellow]Modo preview — importação não realizada.[/yellow]")

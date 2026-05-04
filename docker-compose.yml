@@ -60,7 +60,7 @@ services:
       ollama:
         condition: service_healthy
       scanntech-api:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   # ----------------------------------------------------------
@@ -78,6 +78,11 @@ services:
     ports:
       - "8001:8000"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\""]
+      interval: 15s
+      timeout: 10s
+      retries: 10
 
   # ----------------------------------------------------------
   #  METABASE — dashboards e gráficos visuais

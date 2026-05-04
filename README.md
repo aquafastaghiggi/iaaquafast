@@ -64,7 +64,14 @@ docker logs -f aquafast_ollama
 ## Passo 3 — Instalar dependências Python
 
 ```bash
-pip install duckdb pandas rich chardet
+pip install -r requirements.txt
+```
+
+Se você for desenvolver e quiser rodar os testes locais:
+
+```bash
+pip install -r requirements.txt
+python -m pytest -q
 ```
 
 ---

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iaaquafast"
+version = "0.1.0"
+description = "Aquafast IA local para analise Scanntech"
+requires-python = ">=3.12"
+dependencies = [
+  "chardet==7.4.3",
+  "duckdb==1.5.2",
+  "fastapi==0.115.12",
+  "httpx==0.28.1",
+  "openpyxl==3.1.5",
+  "pandas==3.0.2",
+  "pydantic==2.11.7",
+  "rich==15.0.0",
+  "uvicorn==0.34.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.3",
+]
