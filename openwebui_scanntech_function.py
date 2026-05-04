@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.1
+version: 3.0.2
 requirements: httpx
 """
 
@@ -629,38 +629,6 @@ class Pipe:
             return await self._run_data_pipeline(body, question, export=False)
 
         return await self._run_data_pipeline(body, question, export=False)
-
-    async def _classify_intent(self, question: str) -> str:
-        payload = {
-            "model": self.valves.CHAT_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Classifique a intencao do usuario em JSON puro. "
-                        "Retorne exatamente: {\"route\":\"data\"} ou {\"route\":\"chat\"}. "
-                        "Use \"data\" quando a pergunta pedir analise, numeros, ranking, graficos, clientes, "
-                        "produtos, vendas, receita, SQL ou qualquer consulta ao DuckDB. "
-                        "Use \"chat\" para conversa livre, explicacoes gerais, texto ou ajuda nao relacionada aos dados."
-                    ),
-                },
-                {"role": "user", "content": question},
-            ],
-            "stream": False,
-            "options": {"temperature": 0},
-        }
-
-        async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
-            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
-            response.raise_for_status()
-            data = response.json()
-
-        message = data.get("message", {}) if isinstance(data, dict) else {}
-        content = str(message.get("content", "")).strip()
-        match = re.search(r'"route"\s*:\s*"(data|chat)"', content, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).lower()
-        return "chat"
 
     async def _handle_chart(self, body: dict, question: str) -> str:
         schema = await self._fetch_schema()
