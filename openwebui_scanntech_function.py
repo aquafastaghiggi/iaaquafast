@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.10
+version: 3.0.11
 requirements: httpx
 """
 
@@ -346,6 +346,56 @@ class Pipe:
         q = self._normalize_text(question)
         return any(term in q for term in ["periodo", "periodos", "quando", "mes", "mês", "data", "primeira", "ultima"])
 
+    def _looks_like_client_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(term in q for term in ["cliente", "clientes", "razao social", "razão social", "cnpj"])
+
+    def _looks_like_city_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(term in q for term in ["cidade", "cidades", "municipio", "município", "uf", "estado"])
+
+    def _build_clients_sql_for_months(self, months: list[str]) -> str:
+        safe = []
+        for m in months:
+            mm = str(m).strip()
+            if re.match(r"^\\d{4}-\\d{2}$", mm):
+                safe.append(mm)
+        if not safe:
+            raise ValueError("Nao encontrei meses (YYYY-MM) para montar a consulta de clientes.")
+        in_list = ", ".join(f"'{m}'" for m in safe[:36])
+        return (
+            "SELECT\n"
+            "  SUBSTR(CAST(DATA_VENDA AS VARCHAR), 1, 7) AS mes,\n"
+            "  RAZAO_SOCIAL AS cliente,\n"
+            "  COUNT(*) AS total_pedidos,\n"
+            "  ROUND(SUM(VALOR_TOTAL), 2) AS receita_total\n"
+            "FROM scanntech\n"
+            f"WHERE SUBSTR(CAST(DATA_VENDA AS VARCHAR), 1, 7) IN ({in_list})\n"
+            "GROUP BY 1, 2\n"
+            "ORDER BY receita_total DESC NULLS LAST\n"
+        )
+
+    def _build_cities_sql_for_clients(self, clients: list[str]) -> str:
+        safe = []
+        for c in clients:
+            cc = str(c).strip()
+            if not cc:
+                continue
+            cc = cc.replace("'", "''")
+            safe.append(cc)
+        if not safe:
+            raise ValueError("Nao encontrei clientes para montar a consulta de cidades.")
+        in_list = ", ".join(f"'{c}'" for c in safe[:200])
+        return (
+            "SELECT DISTINCT\n"
+            "  RAZAO_SOCIAL AS cliente,\n"
+            "  UF,\n"
+            "  CIDADE\n"
+            "FROM scanntech\n"
+            f"WHERE RAZAO_SOCIAL IN ({in_list})\n"
+            "ORDER BY cliente, UF, CIDADE\n"
+        )
+
     def _build_period_sql_for_products(self, products: list[str]) -> str:
         safe = []
         for item in products:
@@ -465,6 +515,12 @@ class Pipe:
         preferred = []
         if any(term in q for term in ["receita", "faturamento", "valor total"]):
             preferred = prefer_revenue
+        elif "venda" in q or "vendas" in q:
+            # "maiores vendas" tende a significar receita quando existe uma coluna monetaria.
+            if any(col in lower for col in ["receita", "receita_total", "valor_total", "faturamento"]):
+                preferred = prefer_revenue
+            else:
+                preferred = prefer_qty
         elif any(term in q for term in ["quantidade", "qtd", "vendidos", "vendas", "pedidos"]):
             preferred = prefer_qty
         elif "ticket" in q:
@@ -918,6 +974,57 @@ class Pipe:
                     if pick is not None:
                         products = [r[pick] for r in rows if r and len(r) > pick]
                         sql = self._build_period_sql_for_products(products)
+                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                    # pick month column
+                    pick_mes = None
+                    for key in ["mes", "mês"]:
+                        for i, c in enumerate(lower):
+                            if key == c or key in c:
+                                pick_mes = i
+                                break
+                        if pick_mes is not None:
+                            break
+                    if pick_mes is not None:
+                        months = [r[pick_mes] for r in rows if r and len(r) > pick_mes]
+                        sql = self._build_clients_sql_for_months(months)
+                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+
+            # Follow-up de clientes (ex.: "essas vendas correspondem a quais clientes?") usando o ultimo resultado com meses.
+            if self._looks_like_client_question(routing_text):
+                last_table = self._find_last_table(body)
+                if last_table:
+                    cols, rows = last_table
+                    lower = [c.lower() for c in cols]
+                    pick_mes = None
+                    for key in ["mes", "mês"]:
+                        for i, c in enumerate(lower):
+                            if key == c or key in c:
+                                pick_mes = i
+                                break
+                        if pick_mes is not None:
+                            break
+                    if pick_mes is not None:
+                        months = [r[pick_mes] for r in rows if r and len(r) > pick_mes]
+                        sql = self._build_clients_sql_for_months(months)
+                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+
+            # Follow-up de cidades dos clientes retornados na ultima tabela.
+            if self._looks_like_city_question(routing_text):
+                last_table = self._find_last_table(body)
+                if last_table:
+                    cols, rows = last_table
+                    lower = [c.lower() for c in cols]
+                    pick_cliente = None
+                    for key in ["cliente", "razao_social", "razao social"]:
+                        for i, c in enumerate(lower):
+                            if key == c or key in c:
+                                pick_cliente = i
+                                break
+                        if pick_cliente is not None:
+                            break
+                    if pick_cliente is not None:
+                        clients = [r[pick_cliente] for r in rows if r and len(r) > pick_cliente]
+                        sql = self._build_cities_sql_for_clients(clients)
                         return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
 
             route = self._looks_like_data_question(routing_text)
