@@ -3,3 +3,6 @@
 *.pyc
 exports/generated/
 _tmp_top_produtos.xlsx
+BR_*.txt
+*.duckdb
+*.db
