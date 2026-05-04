@@ -557,7 +557,7 @@ class Pipe:
         if self._is_excel_request(routing_text):
             last_sql = self._find_last_sql(body)
             route_hint = self._looks_like_data_question(routing_text)
-            if not last_sql and route_hint is False:
+            if not last_sql and route_hint is not True:
                 return (
                     "Para gerar Excel, eu preciso de uma consulta de dados antes "
                     "ou de uma pergunta com contexto de vendas, clientes, produtos ou receitas."
@@ -565,6 +565,13 @@ class Pipe:
             return await self._run_data_pipeline(body, question, export=True)
 
         if self._is_chart_request(routing_text):
+            last_sql = self._find_last_sql(body)
+            route_hint = self._looks_like_data_question(routing_text)
+            if not last_sql and route_hint is not True:
+                return (
+                    "Para gerar um grafico, eu preciso de uma pergunta analitica antes "
+                    "ou de uma consulta anterior com dados."
+                )
             return await self._handle_chart(body, question)
 
         route = self._looks_like_data_question(routing_text)
@@ -629,5 +636,4 @@ class Pipe:
                 f"_Linhas retornadas: {result.get('row_count', 0)}_",
             ]
         )
-
 

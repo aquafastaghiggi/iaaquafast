@@ -1,4 +1,11 @@
-from api_fastapi import format_markdown, get_schema_snapshot, legacy_question_to_sql, sanitize_filename
+from api_fastapi import (
+    format_markdown,
+    get_schema_snapshot,
+    legacy_question_to_sql,
+    list_report_specs,
+    run_report,
+    sanitize_filename,
+)
 
 
 def test_sanitize_filename():
@@ -28,3 +35,18 @@ def test_schema_snapshot_has_objects():
     schema = get_schema_snapshot()
     assert schema["object_count"] >= 1
     assert schema["table_count"] >= 1
+
+
+def test_report_catalog_contains_expected_reports():
+    reports = list_report_specs()
+    names = {item["name"] for item in reports}
+    assert {"ranking_clientes", "ranking_produtos", "vendas_por_mes"} <= names
+
+
+def test_run_report_paginates_results():
+    report = run_report("ranking_clientes", page=1, page_size=2)
+    assert report["report_name"] == "ranking_clientes"
+    assert report["page"] == 1
+    assert report["page_size"] == 2
+    assert report["row_count"] == 2
+    assert report["total_rows"] >= 2

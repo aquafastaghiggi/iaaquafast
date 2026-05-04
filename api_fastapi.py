@@ -7,6 +7,7 @@ FastAPI app for deterministic DuckDB queries, schema inspection and Excel export
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import re
 import unicodedata
@@ -25,7 +26,25 @@ from uvicorn import run as uvicorn_run
 APP_NAME = "Aquafast Scanntech API"
 DB_PATH = Path(__file__).with_name("aquafast_scanntech.duckdb")
 EXPORT_DIR = Path(__file__).with_name("exports") / "generated"
-AVAILABLE_REPORTS = ["ranking_clientes", "ranking_produtos", "vendas_por_mes"]
+REPORT_SPECS: dict[str, dict[str, Any]] = {
+    "ranking_clientes": {
+        "title": "Top 20 clientes por valor total",
+        "description": "Ranking dos clientes por valor total, ticket medio e periodo de compra.",
+        "sql": "SELECT * FROM ranking_clientes ORDER BY valor_total DESC NULLS LAST, total_pedidos DESC, cliente",
+    },
+    "ranking_produtos": {
+        "title": "Top 20 produtos mais vendidos",
+        "description": "Ranking dos produtos por volume vendido e receita total.",
+        "sql": "SELECT * FROM ranking_produtos ORDER BY receita_total DESC NULLS LAST, total_vendas DESC, produto",
+    },
+    "vendas_por_mes": {
+        "title": "Vendas por mes",
+        "description": "Serie mensal de pedidos e receita total.",
+        "sql": "SELECT * FROM vendas_por_mes ORDER BY mes",
+    },
+}
+AVAILABLE_REPORTS = list(REPORT_SPECS)
+REPORT_PAGE_SIZE_LIMIT = 200
 
 app = FastAPI(title=APP_NAME, version="1.0.0")
 
@@ -92,6 +111,64 @@ def ensure_read_only_sql(sql: str) -> str:
     if not re.match(r"^(select|with|show|describe)\b", candidate, flags=re.IGNORECASE):
         raise ValueError("A API aceita apenas consultas de leitura.")
     return candidate
+
+
+def clamp_page(value: int) -> int:
+    return max(1, int(value))
+
+
+def clamp_page_size(value: int) -> int:
+    return max(1, min(int(value), REPORT_PAGE_SIZE_LIMIT))
+
+
+def get_report_spec(report_name: str) -> dict[str, Any]:
+    try:
+        return REPORT_SPECS[report_name]
+    except KeyError as exc:
+        raise KeyError(f"Relatorio desconhecido: {report_name}") from exc
+
+
+def list_report_specs() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "title": spec["title"],
+            "description": spec["description"],
+            "default_page_size": 50,
+        }
+        for name, spec in REPORT_SPECS.items()
+    ]
+
+
+def run_report(report_name: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    spec = get_report_spec(report_name)
+    base_sql = ensure_read_only_sql(spec["sql"])
+    page = clamp_page(page)
+    page_size = clamp_page_size(page_size)
+    offset = (page - 1) * page_size
+
+    count_sql = f"SELECT COUNT(*) AS total_rows FROM ({base_sql}) AS report_data"
+    page_sql = f"SELECT * FROM ({base_sql}) AS report_data LIMIT {page_size} OFFSET {offset}"
+
+    total_rows_result = run_query(count_sql)
+    total_rows = int(total_rows_result["rows"][0][0]) if total_rows_result["rows"] else 0
+    total_pages = math.ceil(total_rows / page_size) if total_rows else 0
+
+    page_result = run_query(page_sql)
+    return {
+        "report_name": report_name,
+        "title": spec["title"],
+        "description": spec["description"],
+        "sql": page_sql,
+        "base_sql": base_sql,
+        "page": page,
+        "page_size": page_size,
+        "total_rows": total_rows,
+        "total_pages": total_pages,
+        "has_previous_page": page > 1,
+        "has_next_page": page < total_pages,
+        **page_result,
+    }
 
 
 def write_xlsx_report(title: str, columns: list[str], rows: list[tuple[Any, ...]]) -> Path:
@@ -259,6 +336,7 @@ def health() -> dict[str, Any]:
             "tables": schema["table_count"],
             "views": schema["view_count"],
             "available_reports": AVAILABLE_REPORTS,
+            "report_count": len(REPORT_SPECS),
             "schema_summary": schema["summary_text"],
         }
     except Exception as exc:
@@ -268,9 +346,51 @@ def health() -> dict[str, Any]:
 @app.get("/schema")
 def schema() -> dict[str, Any]:
     try:
-        return {"ok": True, **get_schema_snapshot()}
+        return {
+            "ok": True,
+            **get_schema_snapshot(),
+            "available_reports": list_report_specs(),
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/reports")
+def reports() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "report_count": len(REPORT_SPECS),
+        "page_size_limit": REPORT_PAGE_SIZE_LIMIT,
+        "reports": list_report_specs(),
+    }
+
+
+@app.get("/reports/{report_name}")
+def report(report_name: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    try:
+        return {"ok": True, **run_report(report_name, page=page, page_size=page_size)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/reports/{report_name}/export")
+def report_export(report_name: str) -> dict[str, Any]:
+    try:
+        spec = get_report_spec(report_name)
+        export_result = export_query(spec["sql"], spec["title"])
+        return {
+            "ok": True,
+            "report_name": report_name,
+            "title": spec["title"],
+            "description": spec["description"],
+            **export_result,
+        }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/query")

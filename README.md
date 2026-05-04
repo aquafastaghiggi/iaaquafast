@@ -122,7 +122,8 @@ Se a pergunta não for suportada, ele responde isso explicitamente em vez de inv
 
 - Se você pedir algo analítico, o número vem do DuckDB.
 - Se você pedir explicação, resumo executivo, comparação ou texto em linguagem natural, o `qwen2.5` entra em cena.
-- O sinal mais claro de inteligência aqui é a interpretação da intenção e a forma de explicar o resultado, não a origem dos números.
+- Se você pedir `Excel` ou `gráfico` sem contexto, o sistema pede uma pergunta analítica primeiro em vez de inventar.
+- O sinal mais claro de inteligência aqui é a interpretação da intenção, a geração do SQL e a forma de explicar o resultado, não a origem dos números.
 - Exemplo bom para testar: `me explique em linguagem executiva o que significa esse top 20 de produtos`.
 
 ---
@@ -135,8 +136,13 @@ Na primeira vez:
 1. Complete o setup inicial
 2. Em `Databases` > `Add database`:
    - Tipo: **CSV** (use os arquivos em `./exports/`)
-   - Ou instale o driver DuckDB (ver METABASE_CONFIG.txt)
-3. Crie seus dashboards com os dados Scanntech
+   - Ou instale o driver DuckDB (ver `METABASE_CONFIG.txt`)
+3. Para integração por HTTP/JSON, use os endpoints:
+   - `http://localhost:8001/reports`
+   - `http://localhost:8001/reports/ranking_clientes?page=1&page_size=50`
+   - `http://localhost:8001/reports/ranking_produtos?page=1&page_size=50`
+   - `http://localhost:8001/reports/vendas_por_mes?page=1&page_size=50`
+4. Crie seus dashboards com os dados Scanntech
 
 ---
 
@@ -220,7 +226,7 @@ Veja o arquivo `METABASE_CONFIG.txt` gerado após o ingest.
 ## Próximos passos (quando quiser evoluir)
 
 - [ ] Conectar o n8n para automatizar relatórios por e-mail
-- [ ] Criar API REST sobre o DuckDB para o Metabase consumir
+- [ ] Integrar o Metabase diretamente aos endpoints JSON da API e automatizar refresh dos dashboards
 - [ ] Adicionar Evolution API para responder perguntas via WhatsApp
 - [ ] Migrar modelo para Claude API quando assinar o plano
 

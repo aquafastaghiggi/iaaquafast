@@ -22,6 +22,7 @@
 import duckdb
 import pandas as pd
 import argparse
+import json
 import sys
 import os
 from pathlib import Path
@@ -311,6 +312,7 @@ def relatorio_qualidade(con: duckdb.DuckDBPyConnection, total: int, colunas: lis
     table.add_column("Nulos")
     table.add_column("Únicos (est.)")
     table.add_column("Exemplo")
+    report_rows = []
     
     for col in colunas[:15]:  # Limita a 15 colunas
         try:
@@ -323,6 +325,15 @@ def relatorio_qualidade(con: duckdb.DuckDBPyConnection, total: int, colunas: lis
             """).fetchone()
             
             pct_nulo = f"{stats[0]/total*100:.1f}%" if total > 0 else "0%"
+            report_rows.append(
+                {
+                    "coluna": str(col),
+                    "nulos": int(stats[0]),
+                    "nulos_percentual": round(stats[0] / total * 100, 2) if total > 0 else 0,
+                    "unicos_estimados": int(stats[1]) if stats[1] is not None else None,
+                    "exemplo": str(stats[2] or ""),
+                }
+            )
             table.add_row(
                 str(col)[:25],
                 f"{stats[0]:,} ({pct_nulo})",
@@ -330,9 +341,31 @@ def relatorio_qualidade(con: duckdb.DuckDBPyConnection, total: int, colunas: lis
                 str(stats[2] or "")[:30]
             )
         except Exception:
+            report_rows.append(
+                {
+                    "coluna": str(col),
+                    "nulos": None,
+                    "nulos_percentual": None,
+                    "unicos_estimados": None,
+                    "exemplo": None,
+                }
+            )
             table.add_row(str(col)[:25], "?", "?", "?")
     
     console.print(table)
+    os.makedirs("exports", exist_ok=True)
+    with open("exports/data_quality_report.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "total_registros": total,
+                "colunas_analisadas": report_rows,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    console.print("[green]✓[/green] Relatorio de qualidade salvo em [bold]exports/data_quality_report.json[/bold]")
 
 
 def exportar_config_metabase(db_path: str):
@@ -357,8 +390,14 @@ def exportar_config_metabase(db_path: str):
 #   Path do banco: /metabase-data/{Path(db_path).name}
 #
 # OPÇÃO C (recomendado para produção):
-#   Use o script query_api.py para criar uma API REST
-#   que o Metabase consome via connector HTTP
+#   Use a API FastAPI em http://localhost:8001
+#   Endpoints úteis:
+#     /reports
+#     /reports/ranking_clientes?page=1&page_size=50
+#     /reports/ranking_produtos?page=1&page_size=50
+#     /reports/vendas_por_mes?page=1&page_size=50
+#   Esses endpoints retornam JSON paginado e podem ser usados
+#   por ferramentas externas ou conectores HTTP/JSON compatíveis.
 # ============================================================
 
 DB_PATH={db_path}
