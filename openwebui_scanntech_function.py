@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.8
+version: 3.0.9
 requirements: httpx
 """
 
@@ -294,6 +294,65 @@ class Pipe:
             if match:
                 return match.group(1).strip().rstrip(";")
         return None
+
+    def _find_last_table(self, body: dict) -> tuple[list[str], list[list[str]]] | None:
+        messages = body.get("messages", [])
+        for message in reversed(messages[:-1]):
+            if message.get("role") != "assistant":
+                continue
+            content = str(message.get("content", ""))
+            # Find the last markdown table in the assistant response.
+            lines = [line.rstrip() for line in content.splitlines()]
+            for idx in range(len(lines) - 2):
+                if not lines[idx].lstrip().startswith("|"):
+                    continue
+                if idx + 1 >= len(lines) or "| ---" not in lines[idx + 1]:
+                    continue
+                # capture contiguous table lines
+                table_lines = []
+                j = idx
+                while j < len(lines) and lines[j].lstrip().startswith("|"):
+                    table_lines.append(lines[j])
+                    j += 1
+                if len(table_lines) < 3:
+                    continue
+                header = [cell.strip() for cell in table_lines[0].strip().strip("|").split("|")]
+                rows: list[list[str]] = []
+                for row_line in table_lines[2:]:
+                    cells = [cell.strip() for cell in row_line.strip().strip("|").split("|")]
+                    if len(cells) != len(header):
+                        continue
+                    rows.append(cells)
+                if header and rows:
+                    return header, rows
+        return None
+
+    def _looks_like_period_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(term in q for term in ["periodo", "periodos", "quando", "mes", "mês", "data", "primeira", "ultima"])
+
+    def _build_period_sql_for_products(self, products: list[str]) -> str:
+        safe = []
+        for item in products:
+            cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(item))
+            if cleaned:
+                safe.append(cleaned)
+        if not safe:
+            raise ValueError("Nao encontrei codigos de produto para montar a consulta de periodo.")
+        in_list = ", ".join(f"'{p}'" for p in safe[:50])
+        return (
+            "SELECT\n"
+            "  COD_PRODUTO AS codigo,\n"
+            "  DESC_PRODUTO AS nome,\n"
+            "  MIN(DATA_VENDA) AS primeira_venda,\n"
+            "  MAX(DATA_VENDA) AS ultima_venda,\n"
+            "  SUM(QTD) AS qtd_total,\n"
+            "  ROUND(SUM(VALOR_TOTAL), 2) AS faturamento_total\n"
+            "FROM scanntech\n"
+            f"WHERE COD_PRODUTO IN ({in_list})\n"
+            "GROUP BY COD_PRODUTO, DESC_PRODUTO\n"
+            "ORDER BY faturamento_total DESC NULLS LAST\n"
+        )
 
     async def _fetch_schema(self) -> dict[str, Any]:
         import time
@@ -825,6 +884,26 @@ class Pipe:
                         "ou de uma consulta anterior com dados."
                     )
                 return await self._handle_chart(body, question)
+
+            # Periodo/datas: tenta resolver de forma deterministica usando o ultimo resultado (sem chamar o modelo).
+            if self._looks_like_period_question(routing_text):
+                last_table = self._find_last_table(body)
+                if last_table:
+                    cols, rows = last_table
+                    lower = [c.lower() for c in cols]
+                    # pick product/code column
+                    pick = None
+                    for key in ["codigo", "cod_produto", "produto", "sku"]:
+                        for i, c in enumerate(lower):
+                            if key == c or key in c:
+                                pick = i
+                                break
+                        if pick is not None:
+                            break
+                    if pick is not None:
+                        products = [r[pick] for r in rows if r and len(r) > pick]
+                        sql = self._build_period_sql_for_products(products)
+                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
 
             route = self._looks_like_data_question(routing_text)
             if route is False:
