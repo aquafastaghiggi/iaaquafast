@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.4
+version: 3.0.8
 requirements: httpx
 """
 
@@ -37,6 +37,26 @@ class Pipe:
             default=60.0,
             description="Tempo maximo de espera da consulta",
         )
+        OLLAMA_TIMEOUT_SECONDS: float = Field(
+            default=75.0,
+            description="Tempo maximo de espera das chamadas ao Ollama",
+        )
+        SQL_CONTEXT_MESSAGES: int = Field(
+            default=4,
+            description="Quantas mensagens recentes entram no prompt de SQL",
+        )
+        SUMMARY_ENABLED: bool = Field(
+            default=True,
+            description="Gera resumo via modelo (pode deixar lento)",
+        )
+        MAX_MODEL_TOKENS: int = Field(
+            default=220,
+            description="Limite de tokens de resposta do modelo",
+        )
+        SCHEMA_CACHE_TTL_SECONDS: int = Field(
+            default=600,
+            description="TTL do cache do schema (segundos)",
+        )
         MAX_MESSAGES: int = Field(
             default=12,
             description="Quantidade de mensagens recentes para contexto",
@@ -44,6 +64,8 @@ class Pipe:
 
     def __init__(self):
         self.valves = self.Valves()
+        self._schema_cache: dict[str, Any] | None = None
+        self._schema_cache_ts: float = 0.0
 
     def pipes(self):
         return [{"id": "scanntech_analyst", "name": "Scanntech Analyst"}]
@@ -274,10 +296,20 @@ class Pipe:
         return None
 
     async def _fetch_schema(self) -> dict[str, Any]:
+        import time
+
+        now = time.time()
+        if self._schema_cache and (now - self._schema_cache_ts) < float(self.valves.SCHEMA_CACHE_TTL_SECONDS):
+            return self._schema_cache
+
         async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
             response = await client.get(f"{self.valves.API_BASE_URL}/schema")
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+
+        self._schema_cache = data
+        self._schema_cache_ts = now
+        return data
 
     async def _query_sql(self, sql: str, title: str = "Analise Scanntech") -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
@@ -314,23 +346,151 @@ class Pipe:
                 return sql
         return None
 
+    def _is_revenue_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(term in q for term in ["receita", "faturamento", "valor total", "valor_total", "receita_total"])
+
+    def _is_product_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(term in q for term in ["produto", "produtos", "item", "itens", "sku", "codigo", "código"])
+
+    def _sql_looks_like_row_level(self, sql: str) -> bool:
+        s = self._normalize_text(sql)
+        has_sum = "sum(" in s
+        has_group = "group by" in s
+        # Row-level query often selects from scanntech and orders by a value column without aggregation.
+        return (" from scanntech" in s) and (not has_sum) and (not has_group)
+
+    def _validate_sql_against_question(self, question: str, sql: str) -> str | None:
+        q = self._normalize_text(question)
+        s = self._normalize_text(sql)
+        if self._is_revenue_request(q) and self._is_product_request(q) and self._sql_looks_like_row_level(s):
+            return (
+                "A pergunta pede ranking agregado por produto (faturamento/receita), "
+                "mas o SQL parece estar em nivel de linha. Use SUM(...) e GROUP BY (produto/codigo e descricao)."
+            )
+        return None
+
+    def _as_float(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value).replace(",", "."))
+        except Exception:
+            return None
+
+    def _pick_metric_column(self, question: str, columns: list[str], rows: list[list[Any]]) -> str | None:
+        q = self._normalize_text(question)
+        lower = [c.lower() for c in columns]
+        prefer_revenue = ["receita_total", "valor_total", "receita", "faturamento"]
+        prefer_qty = ["total_vendas", "total_pedidos", "qtd", "quantidade"]
+        prefer_ticket = ["ticket_medio", "ticket"]
+
+        preferred = []
+        if any(term in q for term in ["receita", "faturamento", "valor total"]):
+            preferred = prefer_revenue
+        elif any(term in q for term in ["quantidade", "qtd", "vendidos", "vendas", "pedidos"]):
+            preferred = prefer_qty
+        elif "ticket" in q:
+            preferred = prefer_ticket
+
+        for key in preferred:
+            for idx, col in enumerate(lower):
+                if key == col or key in col:
+                    return columns[idx]
+
+        # fallback: first mostly-numeric column
+        for idx, col in enumerate(columns):
+            values = [self._as_float(r[idx]) for r in rows[: min(len(rows), 30)]]
+            numeric = [v for v in values if v is not None]
+            if numeric and (len(numeric) / max(1, len(values))) >= 0.7:
+                return col
+        return None
+
+    def _pick_label_column(self, columns: list[str], rows: list[list[Any]], metric_col: str | None) -> str | None:
+        if not columns or not rows:
+            return None
+        metric_idx = columns.index(metric_col) if metric_col in columns else -1
+        # choose first non-numeric column (or the first column if unsure)
+        for idx, col in enumerate(columns):
+            if idx == metric_idx:
+                continue
+            values = [rows[r][idx] for r in range(min(len(rows), 10))]
+            numeric = 0
+            for v in values:
+                if self._as_float(v) is not None:
+                    numeric += 1
+            if numeric <= 2:
+                return col
+        return columns[0]
+
+    def _format_metric(self, value: float, metric_col: str | None) -> str:
+        metric = (metric_col or "").lower()
+        if any(k in metric for k in ["receita", "faturamento", "valor_total", "valor total"]):
+            return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.2f}"
+
+    def _deterministic_summary(self, question: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "Nenhum resultado encontrado para essa consulta."
+
+        metric_col = self._pick_metric_column(question, columns, rows)
+        label_col = self._pick_label_column(columns, rows, metric_col)
+        if not metric_col or metric_col not in columns:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        metric_idx = columns.index(metric_col)
+        label_idx = columns.index(label_col) if label_col in columns else 0
+
+        points = []
+        for row in rows:
+            m = self._as_float(row[metric_idx])
+            if m is None:
+                continue
+            points.append((str(row[label_idx]), m))
+
+        if not points:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        points.sort(key=lambda x: x[1], reverse=True)
+        total = sum(v for _, v in points)
+        top = points[:3]
+        lines = []
+        lines.append(f"Metricas: `{metric_col}` (ordenado desc).")
+        lines.append("Top 3:")
+        for i, (name, v) in enumerate(top, start=1):
+            lines.append(f"{i}. {name} - {self._format_metric(v, metric_col)}")
+        if total > 0 and len(points) >= 3:
+            share = sum(v for _, v in top) / total * 100.0
+            lines.append(f"Participacao do top 3 no total listado: {share:.1f}%")
+        return "\n".join(lines)
+
     def _ensure_select_only(self, sql: str) -> str:
         normalized = self._normalize_text(sql)
         if not re.match(r"^(select|with|show|describe)\b", normalized):
             raise ValueError("SQL gerado nao parece ser uma consulta somente leitura.")
         return sql.strip().rstrip(";")
 
-    async def _generate_sql(self, body: dict, question: str, schema_text: str) -> str:
-        messages = body.get("messages", [])[-self.valves.MAX_MESSAGES :]
+    async def _generate_sql(self, body: dict, question: str, schema_text: str, previous_sql: str | None = None) -> str:
+        messages = body.get("messages", [])[-int(self.valves.SQL_CONTEXT_MESSAGES) :]
         user_context = []
         for message in messages:
             role = message.get("role")
             if role not in {"user", "assistant"}:
                 continue
             content = str(message.get("content", "")).strip()
-            if content:
-                user_context.append(f"{role.upper()}: {content}")
+            if not content:
+                continue
+            # evita mandar tabelas gigantes pro modelo
+            if "| --- |" in content or content.count("\n|") > 5:
+                continue
+            user_context.append(f"{role.upper()}: {content[:600]}")
         context_text = "\n".join(user_context) if user_context else "sem contexto adicional"
+        previous_sql_text = f"\n\nSQL anterior (para modificar/continuar se fizer sentido):\n```sql\n{previous_sql}\n```" if previous_sql else ""
 
         prompt = [
             {
@@ -350,7 +510,7 @@ class Pipe:
                 "content": (
                     f"Schema DuckDB:\n{schema_text}\n\n"
                     f"Pergunta do usuario: {question}\n\n"
-                    f"Contexto recente:\n{context_text}"
+                    f"Contexto recente:\n{context_text}{previous_sql_text}"
                 ),
             },
         ]
@@ -359,10 +519,10 @@ class Pipe:
             "model": self.valves.CHAT_MODEL,
             "messages": prompt,
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.0, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
         }
 
-        async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -399,7 +559,7 @@ class Pipe:
             "options": {"temperature": 0.1},
         }
 
-        async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -412,6 +572,9 @@ class Pipe:
         return self._ensure_select_only(sql)
 
     async def _summarize_result(self, question: str, sql: str, markdown_table: str) -> str:
+        # Para performance, nao envie tabela completa. Use apenas as primeiras linhas.
+        snippet_lines = markdown_table.splitlines()[:14]
+        snippet = "\n".join(snippet_lines)
         payload = {
             "model": self.valves.CHAT_MODEL,
             "messages": [
@@ -427,17 +590,17 @@ class Pipe:
                     "content": (
                         f"Pergunta: {question}\n\n"
                         f"SQL executado:\n```sql\n{sql}\n```\n\n"
-                        f"Resultado:\n{markdown_table}\n\n"
+                        f"Resultado (amostra):\n{snippet}\n\n"
                         "Resuma o que o resultado mostra em portugues, em 3 a 6 linhas, "
                         "e destaque a principal leitura de negocio."
                     ),
                 },
             ],
             "stream": False,
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
         }
 
-        async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -475,10 +638,10 @@ class Pipe:
             "model": self.valves.CHAT_MODEL,
             "messages": chat_messages,
             "stream": False,
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.2, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
         }
 
-        async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -489,13 +652,27 @@ class Pipe:
             return "Nao consegui gerar uma resposta agora."
         return content
 
-    async def _run_data_pipeline(self, body: dict, question: str, export: bool = False, chart: bool = False) -> str:
+    async def _run_data_pipeline(
+        self,
+        body: dict,
+        question: str,
+        export: bool = False,
+        chart: bool = False,
+        sql_override: str | None = None,
+    ) -> str:
         schema = await self._fetch_schema()
         schema_text = schema.get("summary_text", "")
-        sql = self._find_last_sql(body)
-
-        if not sql:
-            sql = await self._generate_sql(body, question, schema_text)
+        previous_sql = self._find_last_sql(body)
+        sql = sql_override or await self._generate_sql(body, question, schema_text, previous_sql=previous_sql)
+        validation_error = self._validate_sql_against_question(question, sql)
+        if validation_error:
+            # tenta uma vez regenerar com instrucao extra, sem depender do usuario.
+            sql = await self._generate_sql(
+                body,
+                f"{question}\n\nIMPORTANTE: {validation_error}",
+                schema_text,
+                previous_sql=previous_sql,
+            )
 
         try:
             if export:
@@ -552,7 +729,8 @@ class Pipe:
                 ]
             )
 
-        summary = await self._summarize_result(question, sql, result.get("markdown", ""))
+        # Resumo deterministico: todos os numeros/percentuais sao calculados a partir de (columns, rows).
+        summary = self._deterministic_summary(question, result.get("columns", []), result.get("rows", []))
         return "\n".join(
             [
                 "## Analise Scanntech",
@@ -616,45 +794,52 @@ class Pipe:
         return "\n".join(chart_lines)
 
     async def pipe(self, body: dict):
-        question = self._extract_question(body)
-        routing_text = question
-        if not question:
-            return "Envie uma pergunta sobre os dados da Scanntech."
+        try:
+            question = self._extract_question(body)
+            routing_text = question
+            if not question:
+                return "Envie uma pergunta sobre os dados da Scanntech."
 
-        if self._is_access_question(routing_text):
-            return self._answer_access_question()
+            if self._is_access_question(routing_text):
+                return self._answer_access_question()
 
-        if self._is_explicit_chat_question(routing_text):
-            return await self._ask_chat(body, question)
+            if self._is_explicit_chat_question(routing_text):
+                return await self._ask_chat(body, question)
 
-        if self._is_excel_request(routing_text):
-            last_sql = self._find_last_sql(body)
-            route_hint = self._looks_like_data_question(routing_text)
-            if not last_sql and route_hint is not True:
-                return (
-                    "Para gerar Excel, eu preciso de uma consulta de dados antes "
-                    "ou de uma pergunta com contexto de vendas, clientes, produtos ou receitas."
-                )
-            return await self._run_data_pipeline(body, question, export=True)
+            if self._is_excel_request(routing_text):
+                last_sql = self._find_last_sql(body)
+                route_hint = self._looks_like_data_question(routing_text)
+                if not last_sql and route_hint is not True:
+                    return (
+                        "Para gerar Excel, eu preciso de uma consulta de dados antes "
+                        "ou de uma pergunta com contexto de vendas, clientes, produtos ou receitas."
+                    )
+                return await self._run_data_pipeline(body, question, export=True, sql_override=last_sql)
 
-        if self._is_chart_request(routing_text):
-            last_sql = self._find_last_sql(body)
-            route_hint = self._looks_like_data_question(routing_text)
-            if not last_sql and route_hint is not True:
-                return (
-                    "Para gerar um grafico, eu preciso de uma pergunta analitica antes "
-                    "ou de uma consulta anterior com dados."
-                )
-            return await self._handle_chart(body, question)
+            if self._is_chart_request(routing_text):
+                last_sql = self._find_last_sql(body)
+                route_hint = self._looks_like_data_question(routing_text)
+                if not last_sql and route_hint is not True:
+                    return (
+                        "Para gerar um grafico, eu preciso de uma pergunta analitica antes "
+                        "ou de uma consulta anterior com dados."
+                    )
+                return await self._handle_chart(body, question)
 
-        route = self._looks_like_data_question(routing_text)
-        if route is False:
-            return await self._ask_chat(body, question)
+            route = self._looks_like_data_question(routing_text)
+            if route is False:
+                return await self._ask_chat(body, question)
 
-        if route is True or route is None:
             return await self._run_data_pipeline(body, question, export=False)
-
-        return await self._run_data_pipeline(body, question, export=False)
+        except httpx.TimeoutException:
+            return (
+                "O modelo demorou demais para responder agora (timeout). "
+                "Tenta novamente em alguns segundos; se persistir, posso reduzir o uso do modelo e retornar so a tabela."
+            )
+        except httpx.HTTPError as exc:
+            return f"Ocorreu um erro de rede ao consultar a stack ({type(exc).__name__})."
+        except Exception:
+            return "Opa! Houve um problema ao processar sua pergunta. Tenta de novo; se repetir, eu olho os logs e corrijo."
 
     async def _handle_chart(self, body: dict, question: str) -> str:
         schema = await self._fetch_schema()
