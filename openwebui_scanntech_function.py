@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.2
+version: 3.0.3
 requirements: httpx
 """
 
@@ -77,6 +77,28 @@ class Pipe:
     def _is_chart_request(self, question: str) -> bool:
         q = self._normalize_text(question)
         return any(term in q for term in ["grafico", "chart", "plot", "visualizar em grafico"])
+
+    def _is_access_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        access_terms = [
+            "tem acesso",
+            "acesso a base",
+            "acesso a dados",
+            "acessar a base",
+            "consegue acessar",
+            "voce tem acesso",
+            "base de dados",
+            "dados da scanntech",
+            "base da scanntech",
+        ]
+        return self._contains_any(q, access_terms)
+
+    def _answer_access_question(self) -> str:
+        return (
+            "Tenho acesso ao banco local do projeto Scanntech conectado ao DuckDB e à API interna da stack. "
+            "Consigo consultar os dados ingeridos no ambiente local, gerar análises, gráficos e exportações. "
+            "Não tenho acesso a bases externas ou confidenciais fora deste ambiente."
+        )
 
     def _is_excel_request(self, question: str) -> bool:
         q = self._normalize_text(question)
@@ -431,7 +453,8 @@ class Pipe:
                 "role": "system",
                 "content": (
                     "Voce e o Aquafast IA. Responda em portugues, de forma util, curta e honesta. "
-                    "Se a pergunta for sobre os dados da Scanntech, deixe claro quando esta consultando dados e quando esta apenas explicando."
+                    "Se a pergunta for sobre os dados da Scanntech, deixe claro quando esta consultando dados e quando esta apenas explicando. "
+                    "Nao afirme que nao ha acesso aos dados locais da stack quando a pergunta for sobre a base do projeto."
                 ),
             }
         ]
@@ -597,6 +620,9 @@ class Pipe:
         routing_text = self._combined_user_text(body) or question
         if not question:
             return "Envie uma pergunta sobre os dados da Scanntech."
+
+        if self._is_access_question(routing_text):
+            return self._answer_access_question()
 
         if self._is_explicit_chat_question(routing_text):
             return await self._ask_chat(body, question)
