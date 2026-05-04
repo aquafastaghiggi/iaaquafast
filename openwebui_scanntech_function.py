@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.3
+version: 3.0.4
 requirements: httpx
 """
 
@@ -617,7 +617,7 @@ class Pipe:
 
     async def pipe(self, body: dict):
         question = self._extract_question(body)
-        routing_text = self._combined_user_text(body) or question
+        routing_text = question
         if not question:
             return "Envie uma pergunta sobre os dados da Scanntech."
 
