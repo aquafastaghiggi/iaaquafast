@@ -97,6 +97,51 @@ class Pipe:
     def _contains_any(self, text: str, terms: list[str]) -> bool:
         return any(term in text for term in terms)
 
+    def _is_explicit_chat_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+
+        chat_terms = [
+            "como funciona",
+            "como voce funciona",
+            "explique",
+            "resuma",
+            "escreva",
+            "revise",
+            "melhore",
+            "ajude",
+            "o que e",
+            "quem e voce",
+            "qual sua funcao",
+            "tem acesso",
+            "acesso a base",
+            "acessar a base",
+            "consegue acessar",
+            "voce tem acesso",
+            "por que",
+            "porque",
+            "conserte",
+            "traduza",
+            "oi",
+            "ola",
+            "bom dia",
+            "boa tarde",
+            "boa noite",
+            "obrigado",
+            "valeu",
+        ]
+
+        chat_patterns = [
+            r"\b(como funciona|como voce funciona|explique|resuma|escreva|revise|melhore|ajude|traduza)\b",
+            r"\b(tem acesso|acesso a base|acessar a base|consegue acessar|voce tem acesso)\b",
+            r"\b(quem e voce|qual sua funcao|o que e|por que|porque)\b",
+            r"^\s*(oi|ol[aá]|bom dia|boa tarde|boa noite|obrigado|valeu)\s*[!?.,]*\s*$",
+        ]
+
+        if self._contains_any(q, chat_terms):
+            return True
+
+        return any(re.search(pattern, q) for pattern in chat_patterns)
+
     def _looks_like_data_question(self, question: str) -> bool | None:
         q = self._normalize_text(question)
 
@@ -553,9 +598,7 @@ class Pipe:
         if not question:
             return "Envie uma pergunta sobre os dados da Scanntech."
 
-        normalized = self._normalize_text(routing_text)
-
-        if self._contains_any(normalized, ["tem acesso", "acesso a base", "acessar a base", "consegue acessar", "voce tem acesso", "voce consegue acessar"]):
+        if self._is_explicit_chat_question(routing_text):
             return await self._ask_chat(body, question)
 
         if self._is_excel_request(routing_text):
@@ -579,13 +622,13 @@ class Pipe:
             return await self._handle_chart(body, question)
 
         route = self._looks_like_data_question(routing_text)
-        if route is None:
-            route = await self._classify_intent(question)
+        if route is False:
+            return await self._ask_chat(body, question)
 
-        if route == "data":
+        if route is True or route is None:
             return await self._run_data_pipeline(body, question, export=False)
 
-        return await self._ask_chat(body, question)
+        return await self._run_data_pipeline(body, question, export=False)
 
     async def _classify_intent(self, question: str) -> str:
         payload = {
