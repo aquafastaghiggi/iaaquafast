@@ -263,6 +263,7 @@ class Pipe:
             content = str(message.get("content", "")).strip()
             if content:
                 user_context.append(f"{role.upper()}: {content}")
+        context_text = "\n".join(user_context) if user_context else "sem contexto adicional"
 
         prompt = [
             {
@@ -282,7 +283,7 @@ class Pipe:
                 "content": (
                     f"Schema DuckDB:\n{schema_text}\n\n"
                     f"Pergunta do usuario: {question}\n\n"
-                    f"Contexto recente:\n{'\\n'.join(user_context) if user_context else 'sem contexto adicional'}"
+                    f"Contexto recente:\n{context_text}"
                 ),
             },
         ]
