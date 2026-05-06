@@ -51,11 +51,15 @@ services:
       - webui_data:/app/backend/data
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
+      - ENABLE_MODEL_FILTER=true
+      - MODEL_FILTER_LIST=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
       - WEBUI_SECRET_KEY=aquafast_secret_2026   # troque por uma chave segura
       - WEBUI_NAME=Aquafast IA                  # nome que aparece na interface
       # Padrão de trabalho do projeto: manter Scanntech Analyst como porta de entrada.
       # Observacao: para Pipes/Functions, o Open WebUI usa o id completo "<function_id>.<pipe_id>".
       - DEFAULT_MODELS=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
+      - DEFAULT_PINNED_MODELS=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
+      - DEFAULT_PROMPT_SUGGESTIONS=[{"title":["Quantas lojas a Aquafast tem hoje?"],"content":"Quantas lojas a Aquafast tem hoje?"},{"title":["Em quantos pontos de venda a Aquafast está presente hoje?"],"content":"Em quantos pontos de venda a Aquafast está presente hoje?"},{"title":["Qual o maior concorrente da Aquafast?"],"content":"Qual o maior concorrente da Aquafast?"},{"title":["Quais produtos teriam mais potencial de venda?"],"content":"Quais produtos teriam mais potencial de venda?"},{"title":["Top 20 produtos mais vendidos"],"content":"Top 20 produtos Aquafast por caixa"},{"title":["Top 20 clientes por valor"],"content":"Top 20 clientes Aquafast por caixa"},{"title":["Vendas por mês"],"content":"Mostre as vendas da Aquafast por mês"},{"title":["Vendas por estado"],"content":"Mostre as vendas da Aquafast por estado"}]
       - ENABLE_SIGNUP=true                      # permite o primeiro cadastro
       - DEFAULT_USER_ROLE=user
     depends_on:
@@ -77,6 +81,12 @@ services:
     working_dir: /workspace
     volumes:
       - ./:/workspace
+    environment:
+      - AQUAFAST_MYSQL_HOST=host.docker.internal
+      - AQUAFAST_MYSQL_PORT=3306
+      - AQUAFAST_MYSQL_USER=root
+      - AQUAFAST_MYSQL_PASSWORD=k7m2y9u4
+      - AQUAFAST_MYSQL_DATABASE=scanntech
     ports:
       - "8001:8000"
     restart: unless-stopped

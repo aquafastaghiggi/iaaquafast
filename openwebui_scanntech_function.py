@@ -1,7 +1,7 @@
 """
 title: Scanntech Analyst
 author: Codex
-version: 3.0.12
+version: 3.0.15
 requirements: httpx
 """
 
@@ -10,10 +10,18 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
+
+HELPER_PATH = Path("/tmp")
+if HELPER_PATH.exists() and str(HELPER_PATH) not in sys.path:
+    sys.path.insert(0, str(HELPER_PATH))
+
+from aquafast_semantics import normalize_business_question, repair_mojibake
 
 
 class Pipe:
@@ -34,24 +42,40 @@ class Pipe:
             description="Modelo usado para conversa livre e geracao de SQL",
         )
         TIMEOUT_SECONDS: float = Field(
-            default=60.0,
-            description="Tempo maximo de espera da consulta",
+            default=180.0,
+            description="Timeout HTTP da Scanntech API (consultas pesadas em CPU)",
         )
         OLLAMA_TIMEOUT_SECONDS: float = Field(
-            default=75.0,
-            description="Tempo maximo de espera das chamadas ao Ollama",
+            default=240.0,
+            description="Timeout das chamadas ao Ollama (geracao/correcao de SQL e chat)",
+        )
+        LEGACY_ASK_TIMEOUT_SECONDS: float = Field(
+            default=45.0,
+            description="Timeout so para POST /ask (consultas pre-mapeadas, sem LLM)",
+        )
+        OLLAMA_SQL_TIMEOUT_SECONDS: float = Field(
+            default=120.0,
+            description="Timeout para gerar/corrigir SQL no Ollama (menor que o chat para nao ficar minutos parado)",
         )
         SQL_CONTEXT_MESSAGES: int = Field(
             default=4,
             description="Quantas mensagens recentes entram no prompt de SQL",
         )
         SUMMARY_ENABLED: bool = Field(
-            default=True,
-            description="Gera resumo via modelo (pode deixar lento)",
+            default=False,
+            description="Reservado: o resumo analitico e deterministico (tabela + metricas). LLM nao reescreve numeros.",
         )
         MAX_MODEL_TOKENS: int = Field(
             default=220,
-            description="Limite de tokens de resposta do modelo",
+            description="Limite de tokens no modo chat (respostas curtas)",
+        )
+        SQL_MAX_TOKENS: int = Field(
+            default=900,
+            description="Limite de tokens para gerar/corrigir SQL (220 truncava consultas longas)",
+        )
+        SQL_SAFETY_ROW_CAP: int = Field(
+            default=2000,
+            description="Se o SQL nao tiver LIMIT final, envolve em subselect com este teto (alinha com a API /query)",
         )
         SCHEMA_CACHE_TTL_SECONDS: int = Field(
             default=600,
@@ -71,6 +95,7 @@ class Pipe:
         return [{"id": "scanntech_analyst", "name": "Scanntech Analyst"}]
 
     def _normalize_text(self, text: str) -> str:
+        text = repair_mojibake(text)
         normalized = unicodedata.normalize("NFKD", text)
         ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
         return " ".join(ascii_text.lower().split())
@@ -79,7 +104,7 @@ class Pipe:
         if content is None:
             return ""
         if isinstance(content, str):
-            return content
+            return repair_mojibake(content)
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
@@ -125,18 +150,17 @@ class Pipe:
             "consegue acessar",
             "voce tem acesso",
             "base de dados",
-            "dados da scanntech",
-            "base da scanntech",
+            "dados da aquafast",
+            "base da aquafast",
         ]
         return self._contains_any(q, access_terms)
 
     def _answer_access_question(self) -> str:
-        return (
-            "Tenho acesso ao banco local do projeto Scanntech conectado ao DuckDB e à API interna da stack. "
+        return repair_mojibake(
+            "Tenho acesso ao banco local do projeto Aquafast conectado ao DuckDB e à API interna da stack. "
             "Consigo consultar os dados ingeridos no ambiente local, gerar análises, gráficos e exportações. "
             "Não tenho acesso a bases externas ou confidenciais fora deste ambiente."
         )
-
     def _is_excel_request(self, question: str) -> bool:
         q = self._normalize_text(question)
         return any(
@@ -174,12 +198,12 @@ class Pipe:
             "email",
             "e-mail",
             "paragrafo",
-            "parágrafo",
+            "parÃ¡grafo",
             "frase",
             "prompt",
             "documento",
             "relatorio",
-            "relatório",
+            "relatÃ³rio",
         ]
         if any(re.search(rf"\\b{re.escape(v)}\\b", q) for v in edit_verbs) and self._contains_any(q, edit_objects):
             return True
@@ -221,7 +245,7 @@ class Pipe:
             r"\b(como funciona|como voce funciona|explique|resuma|escreva|revise|melhore|ajude|traduza)\b",
             r"\b(tem acesso|acesso a base|acessar a base|consegue acessar|voce tem acesso)\b",
             r"\b(quem e voce|qual sua funcao|o que e|por que|porque)\b",
-            r"^\s*(oi|ol[aá]|bom dia|boa tarde|boa noite|obrigado|valeu)\s*[!?.,]*\s*$",
+            r"^\s*(oi|ol[aÃ¡]|bom dia|boa tarde|boa noite|obrigado|valeu)\s*[!?.,]*\s*$",
         ]
 
         # evita falso positivo de substring (ex.: "melhores" vs "melhore")
@@ -230,10 +254,17 @@ class Pipe:
         if self._looks_like_edit_request(q):
             return True
 
-        return any(re.search(pattern, q) for pattern in chat_patterns)
+        if any(re.search(pattern, q) for pattern in chat_patterns):
+            # Ex.: "qual sua funcao e me de o top 5 clientes" nao pode cair so no chat livre.
+            if self._looks_like_data_question(q):
+                return False
+            return True
+
+        return False
 
     def _looks_like_data_question(self, question: str) -> bool | None:
-        q = self._normalize_text(question)
+        q = normalize_business_question(question)
+        q = self._normalize_text(q)
 
         data_terms = [
             "cliente",
@@ -280,6 +311,40 @@ class Pipe:
             "consulta",
             "duckdb",
             "sql",
+            "loja",
+            "lojas",
+            "pontos de venda",
+            "pdv",
+            "ponto de venda",
+            "rede",
+            "bandeira",
+            "mix",
+            "categoria",
+            "marca",
+            "marcas",
+            "abc",
+            "curva",
+            "comparar",
+            "comparacao",
+            "concorrente",
+            "concorrentes",
+            "concorrencia",
+            "competidor",
+            "competidores",
+            "municipio",
+            "regiao",
+            "estoque",
+            "participacao",
+            "share",
+            "market",
+            "volume",
+            "item",
+            "caixa",
+            "caixas",
+            "portifolio",
+            "portfolio",
+            "aquafast",
+            "litragem",
         ]
 
         chat_terms = [
@@ -308,7 +373,7 @@ class Pipe:
         data_patterns = [
             r"\b(top|ranking|lista|listar|mostrar|mostre|quais|qual|quantos|quanto|maior|maiores|menor|menores|melhor|piores)\b",
             r"\b(cliente|clientes|produto|produtos|sku|venda|vendas|receita|faturamento|ticket|churn)\b",
-            r"\b(razao social|cnpj|uf|cidade|canal|mes|m[eê]s|periodo)\b",
+            r"\b(razao social|cnpj|uf|cidade|canal|mes|m[eÃª]s|periodo)\b",
             r"\b(mais vendidos|mais comprados|valor total|ticket medio)\b",
         ]
         chat_patterns = [
@@ -376,19 +441,19 @@ class Pipe:
 
     def _looks_like_period_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["periodo", "periodos", "quando", "mes", "mês", "data", "primeira", "ultima"])
+        return any(term in q for term in ["periodo", "periodos", "quando", "mes", "mÃªs", "data", "primeira", "ultima"])
 
     def _looks_like_client_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["cliente", "clientes", "razao social", "razão social", "cnpj"])
+        return any(term in q for term in ["cliente", "clientes", "razao social", "razÃ£o social", "cnpj"])
 
     def _looks_like_city_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["cidade", "cidades", "municipio", "município", "uf", "estado"])
+        return any(term in q for term in ["cidade", "cidades", "municipio", "municÃ­pio", "uf", "estado"])
 
     def _looks_like_product_name_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        # _normalize_text remove acentos, entao "descrição" vira "descricao"
+        # _normalize_text remove acentos, entao "descriÃ§Ã£o" vira "descricao"
         return any(term in q for term in ["nome", "descricao", "desc_produto", "descr"])
 
     def _looks_like_ticket_question(self, question: str) -> bool:
@@ -465,7 +530,7 @@ class Pipe:
             "  MIN(DESC_PRODUTO) AS nome\n"
             "FROM scanntech\n"
             f"WHERE COD_PRODUTO IN ({in_list})\n"
-            "  AND NULLIF(TRIM(CAST(DESC_PRODUTO AS VARCHAR)), '') IS NOT NULL\n"
+            "  AND NULLIF(TRIM(DESC_PRODUTO), '') IS NOT NULL\n"
             "GROUP BY COD_PRODUTO\n"
             "ORDER BY codigo\n"
         )
@@ -492,7 +557,7 @@ class Pipe:
             "FROM scanntech\n"
             f"WHERE COD_PRODUTO IN ({in_list})\n"
             "GROUP BY COD_PRODUTO\n"
-            "ORDER BY faturamento_total DESC NULLS LAST\n"
+            "ORDER BY faturamento_total DESC\n"
         )
 
     def _build_last_sale_sql_for_products(self, products: list[str]) -> str:
@@ -526,7 +591,7 @@ class Pipe:
         safe = []
         for m in months:
             mm = str(m).strip()
-            if re.match(r"^\\d{4}-\\d{2}$", mm):
+            if re.match(r"^\d{4}-\d{2}$", mm):
                 safe.append(mm)
         if not safe:
             raise ValueError("Nao encontrei meses (YYYY-MM) para montar a consulta de clientes.")
@@ -540,7 +605,7 @@ class Pipe:
             "FROM scanntech\n"
             f"WHERE SUBSTR(CAST(DATA_VENDA AS VARCHAR), 1, 7) IN ({in_list})\n"
             "GROUP BY 1, 2\n"
-            "ORDER BY receita_total DESC NULLS LAST\n"
+            "ORDER BY receita_total DESC\n"
         )
 
     def _build_cities_sql_for_clients(self, clients: list[str]) -> str:
@@ -556,12 +621,14 @@ class Pipe:
         in_list = ", ".join(f"'{c}'" for c in safe[:200])
         return (
             "SELECT DISTINCT\n"
-            "  RAZAO_SOCIAL AS cliente,\n"
-            "  UF,\n"
-            "  CIDADE\n"
-            "FROM scanntech\n"
-            f"WHERE RAZAO_SOCIAL IN ({in_list})\n"
-            "ORDER BY cliente, UF, CIDADE\n"
+            "  s.RAZAO_SOCIAL AS cliente,\n"
+            "  c.PDV_STATE AS uf,\n"
+            "  c.PDV_LOCATION AS cidade\n"
+            "FROM scanntech s\n"
+            "JOIN scanntech_clientes_raw c\n"
+            "  ON LOWER(TRIM(s.RAZAO_SOCIAL)) = LOWER(TRIM(COALESCE(c.PDV_SOCIAL_NAME, c.PDV_NAME)))\n"
+            f"WHERE s.RAZAO_SOCIAL IN ({in_list})\n"
+            "ORDER BY cliente, uf, cidade\n"
         )
 
     def _build_period_sql_for_products(self, products: list[str]) -> str:
@@ -584,7 +651,7 @@ class Pipe:
             "FROM scanntech\n"
             f"WHERE COD_PRODUTO IN ({in_list})\n"
             "GROUP BY COD_PRODUTO, DESC_PRODUTO\n"
-            "ORDER BY faturamento_total DESC NULLS LAST\n"
+            "ORDER BY faturamento_total DESC\n"
         )
 
     async def _fetch_schema(self) -> dict[str, Any]:
@@ -603,7 +670,7 @@ class Pipe:
         self._schema_cache_ts = now
         return data
 
-    async def _query_sql(self, sql: str, title: str = "Analise Scanntech") -> dict[str, Any]:
+    async def _query_sql(self, sql: str, title: str = "Analise Aquafast") -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.valves.TIMEOUT_SECONDS) as client:
             response = await client.post(
                 f"{self.valves.API_BASE_URL}/query",
@@ -644,7 +711,7 @@ class Pipe:
 
     def _is_product_request(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["produto", "produtos", "item", "itens", "sku", "codigo", "código"])
+        return any(term in q for term in ["produto", "produtos", "item", "itens", "sku", "codigo", "cÃ³digo"])
 
     def _sql_looks_like_row_level(self, sql: str) -> bool:
         s = self._normalize_text(sql)
@@ -681,6 +748,8 @@ class Pipe:
         prefer_ticket = ["ticket_medio", "ticket"]
 
         preferred = []
+        if any(term in q for term in ["concorrente", "concorrentes", "concorrencia", "competidor", "competidores", "market share", "participacao", "share"]):
+            preferred = ["market_share_pct", "total_receita", "receita_total", "receita", "valor_total"]
         if any(term in q for term in ["receita", "faturamento", "valor total"]):
             preferred = prefer_revenue
         elif "venda" in q or "vendas" in q:
@@ -727,10 +796,18 @@ class Pipe:
     def _format_metric(self, value: float, metric_col: str | None) -> str:
         metric = (metric_col or "").lower()
         if any(k in metric for k in ["receita", "faturamento", "valor_total", "valor total"]):
-            return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            return f"R$ {self._format_ptbr_number(value)}"
         if value.is_integer():
-            return str(int(value))
-        return f"{value:.2f}"
+            return self._format_ptbr_number(int(value))
+        return self._format_ptbr_number(value)
+
+    def _format_ptbr_number(self, value: float | int) -> str:
+        if isinstance(value, int):
+            return f"{value:,}".replace(",", ".")
+        if float(value).is_integer():
+            return f"{int(value):,}".replace(",", ".")
+        text = f"{float(value):,.2f}"
+        return text.replace(",", "X").replace(".", ",").replace("X", ".")
 
     def _deterministic_summary(self, question: str, columns: list[str], rows: list[list[Any]]) -> str:
         if not rows:
@@ -743,6 +820,16 @@ class Pipe:
 
         metric_idx = columns.index(metric_col)
         label_idx = columns.index(label_col) if label_col in columns else 0
+
+        if len(rows) == 1:
+            row = rows[0]
+            metric_value = self._as_float(row[metric_idx])
+            if metric_value is not None:
+                formatted = self._format_metric(metric_value, metric_col)
+                if label_col in columns and label_col != metric_col:
+                    label_value = str(row[label_idx])
+                    return f"{label_value}: {formatted}"
+                return f"{metric_col}: {formatted}"
 
         points = []
         for row in rows:
@@ -767,11 +854,84 @@ class Pipe:
             lines.append(f"Participacao do top 3 no total listado: {share:.1f}%")
         return "\n".join(lines)
 
+    def _source_note_from_result(self, question: str, result: dict[str, Any]) -> str:
+        note = str(result.get("source_note", "") or "").strip()
+        if note:
+            return note
+
+        title = str(result.get("title", "") or "")
+        sql = str(result.get("sql", "") or "")
+        text = self._normalize_text(" ".join([question, title, sql]))
+
+        if "potencial de venda" in text or "maior potencial" in text:
+            return (
+                "Fonte: `top_produtos_categoria`. "
+                "A consulta usa a presenca em PDVs e o volume em caixas como proxy de potencial de venda."
+            )
+        if any(term in text for term in ["maior concorrente", "concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
+            return (
+                "Fonte: `ms_mercado_aquafast`. "
+                "A consulta compara os fabricantes do mercado da categoria e exclui a Aquafast para apontar concorrentes."
+            )
+        if any(term in text for term in ["market share", "participacao", "share"]):
+            return (
+                "Fonte: `ms_mercado_aquafast`. "
+                "A consulta mede a participacao de cada fabricante dentro do mercado da categoria."
+            )
+        if any(term in text for term in ["ponto de venda", "pontos de venda", "loja", "lojas", "pdv"]):
+            return (
+                "Fonte: `ranking_clientes`. "
+                "A consulta conta as lojas/PDVs que aparecem com venda Aquafast no periodo carregado."
+            )
+        if any(term in text for term in ["produto por categoria", "categoria", "litragem", "mix"]):
+            return (
+                "Fonte: `top_produtos_categoria`. "
+                "A consulta cruza o portfolio Aquafast com caixas para enxergar o mix por categoria."
+            )
+        if any(term in text for term in ["vendas por mes", "vendas por mÃªs", "mensal", "serie mensal", "sÃ©rie mensal"]):
+            return (
+                "Fonte: `vendas_por_mes`. "
+                "A consulta consolida caixas e receita ao longo do tempo para mostrar tendencia mensal."
+            )
+        if any(term in text for term in ["vendas por estado", "estado", "uf"]):
+            return (
+                "Fonte: `vendas_caixas_estado`. "
+                "A consulta cruza as vendas Aquafast com a UF para mostrar distribuicao geografica."
+            )
+        if any(term in text for term in ["top produtos", "ranking produtos", "mais vendidos", "receita por produto", "volume de vendas"]):
+            return (
+                "Fonte: `ranking_produtos`. "
+                "A consulta lista os produtos Aquafast com maior volume em caixas e receita."
+            )
+        if any(term in text for term in ["clientes", "lojas", "churn", "compra"]):
+            return (
+                "Fonte: `ranking_clientes`. "
+                "A consulta resume as lojas Aquafast por caixas vendidas, receita e recorrencia."
+            )
+        return "Fonte: consulta local no DuckDB usando as views semanticas da Aquafast."
+
     def _ensure_select_only(self, sql: str) -> str:
         normalized = self._normalize_text(sql)
         if not re.match(r"^(select|with|show|describe)\b", normalized):
             raise ValueError("SQL gerado nao parece ser uma consulta somente leitura.")
         return sql.strip().rstrip(";")
+
+    def _wrap_sql_for_safe_rows(self, sql: str, *, for_export: bool) -> str:
+        """
+        Evita SELECT sem LIMIT puxando milhoes de linhas (lento no DuckDB e no chat).
+        Exportacao Excel usa so o teto da API (EXPORT); nao aplica este wrap.
+        """
+        if for_export:
+            return sql.strip().rstrip(";")
+        s = sql.strip().rstrip(";")
+        low = s.lower()
+        if not (low.startswith("select") or low.startswith("with")):
+            return s
+        collapsed = re.sub(r"\s+", " ", low).strip()
+        if re.search(r"\blimit\s+\d+(\s+offset\s+\d+)?\s*$", collapsed):
+            return s
+        cap = max(1, int(self.valves.SQL_SAFETY_ROW_CAP))
+        return f"SELECT * FROM ({s}) AS _aquafast_safe LIMIT {cap}"
 
     async def _generate_sql(self, body: dict, question: str, schema_text: str, previous_sql: str | None = None) -> str:
         messages = body.get("messages", [])[-int(self.valves.SQL_CONTEXT_MESSAGES) :]
@@ -783,7 +943,7 @@ class Pipe:
             content = self._content_to_text(message.get("content", ""))
             if not content:
                 continue
-            # evita mandar tabelas gigantes pro modelo
+        # evita mandar tabelas gigantes pro modelo
             if "| --- |" in content or content.count("\n|") > 5:
                 continue
             user_context.append(f"{role.upper()}: {content[:600]}")
@@ -794,19 +954,23 @@ class Pipe:
             {
                 "role": "system",
                 "content": (
-                    "Voce e um analista de dados especializado em DuckDB. "
+                    "Voce e um analista de dados especializado no portfolio Aquafast sobre DuckDB. "
+                    "A regra padrao e analisar apenas o mercado Aquafast, usando caixas como base de negocio e evitando a leitura do universo bruto da Scanntech. "
+                    "Para perguntas operacionais de resultado, ranking e evolucao, considere apenas os itens Aquafast (is_aquafast = 1). "
+                    "Use o universo completo da categoria apenas quando a pergunta for explicitamente de concorrencia, market share ou comparacao de mercado. "
                     "Gere apenas SQL valido e somente leitura. "
                     "Use apenas tabelas, views e colunas existentes no schema fornecido. "
                     "Responda com um unico bloco de codigo Markdown ```sql ... ``` e nada mais. "
                     "Se a pergunta pedir top 20, use LIMIT 20. "
-                    "Prefira as views ranking_clientes, ranking_produtos e vendas_por_mes quando elas atenderem a pergunta. "
+                    "Sempre termine consultas exploratorias com LIMIT (ex.: 200 ou 500) quando nao houver agregacao que ja reduza o resultado. "
+                    "Prefira as views ranking_clientes, ranking_produtos, vendas_por_mes, ms_mercado_aquafast, vendas_caixas_estado e top_produtos_categoria quando elas atenderem a pergunta. "
                     "Nao invente colunas. Nao use INSERT, UPDATE, DELETE, DROP ou ALTER."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Schema DuckDB:\n{schema_text}\n\n"
+                    f"Schema DuckDB/Aquafast:\n{schema_text}\n\n"
                     f"Pergunta do usuario: {question}\n\n"
                     f"Contexto recente:\n{context_text}{previous_sql_text}"
                 ),
@@ -817,10 +981,14 @@ class Pipe:
             "model": self.valves.CHAT_MODEL,
             "messages": prompt,
             "stream": False,
-            "options": {"temperature": 0.0, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
+            "options": {"temperature": 0.0, "num_predict": int(self.valves.SQL_MAX_TOKENS)},
         }
 
-        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
+        sql_timeout = min(
+            float(self.valves.OLLAMA_TIMEOUT_SECONDS),
+            float(self.valves.OLLAMA_SQL_TIMEOUT_SECONDS),
+        )
+        async with httpx.AsyncClient(timeout=sql_timeout) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -854,10 +1022,14 @@ class Pipe:
                 },
             ],
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.SQL_MAX_TOKENS)},
         }
 
-        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
+        sql_timeout = min(
+            float(self.valves.OLLAMA_TIMEOUT_SECONDS),
+            float(self.valves.OLLAMA_SQL_TIMEOUT_SECONDS),
+        )
+        async with httpx.AsyncClient(timeout=sql_timeout) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -878,10 +1050,10 @@ class Pipe:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "Voce e o Aquafast IA. Explique o resultado de forma objetiva, executiva e honesta. "
-                        "Nao invente numeros. Use exatamente os valores fornecidos na tabela."
-                    ),
+                "content": (
+                "Voce e o Aquafast IA. Explique o resultado de forma objetiva, executiva e honesta. "
+                "Nao invente numeros. Use exatamente os valores fornecidos na tabela."
+            ),
                 },
                 {
                     "role": "user",
@@ -913,8 +1085,12 @@ class Pipe:
             {
                 "role": "system",
                 "content": (
-                    "Voce e o Aquafast IA. Responda em portugues, de forma util, curta e honesta. "
-                    "Se a pergunta for sobre os dados da Scanntech, deixe claro quando esta consultando dados e quando esta apenas explicando. "
+                    "Voce e o Aquafast IA (modo conversa, sem consulta SQL nesta rodada). "
+                    "Responda em portugues, de forma util e curta. "
+                    "NUNCA invente numeros, totais, rankings, nomes de clientes ou produtos, nem datas de vendas. "
+                    "A regra padrao e falar do portfolio Aquafast e do mercado Aquafast, sempre pensando em caixas e nao em unidade avulsa. "
+                    "Se o usuario pedir qualquer dado concreto da base, diga explicitamente que ele deve reformular como pergunta analitica no mesmo chat "
+                    "(ex.: 'top 10 lojas Aquafast por caixa') para o sistema executar SQL no DuckDB. "
                     "Nao afirme que nao ha acesso aos dados locais da stack quando a pergunta for sobre a base do projeto."
                 ),
             }
@@ -950,6 +1126,68 @@ class Pipe:
             return "Nao consegui gerar uma resposta agora."
         return content
 
+    def _http_status_error_message(self, exc: httpx.HTTPStatusError) -> str:
+        detail = ""
+        if exc.response is not None:
+            try:
+                detail = exc.response.text.strip()
+            except Exception:
+                detail = ""
+        if len(detail) > 800:
+            detail = detail[:797] + "..."
+        code = exc.response.status_code if exc.response is not None else "?"
+        return repair_mojibake(
+            f"Erro HTTP {code} na API Aquafast.\n\n"
+            f"{detail or '(sem detalhe no corpo da resposta)'}\n\n"
+            "Confirme se o servico da API esta no ar, a URL em Valves (ex.: `http://scanntech-api:8000`) "
+            "bate com o `docker compose` e se o arquivo `aquafast_scanntech.duckdb` existe no container."
+        )
+    def _build_analysis_response(self, question: str, result: dict[str, Any], sql_hint: str) -> str:
+        summary = repair_mojibake(self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])))
+        source_note = repair_mojibake(self._source_note_from_result(question, result))
+        markdown = repair_mojibake(result.get("markdown", ""))
+        cap_note = ""
+        if result.get("truncated"):
+            cap = result.get("row_cap")
+            cap_note = repair_mojibake(
+                f"\n\n_Amostra limitada pela API ({cap} linhas no maximo). "
+                "Refine a pergunta com filtros (mes, cliente, produto) ou use LIMIT menor no SQL para ver tudo no Excel._"
+            )
+        return "\n".join(
+            [
+                repair_mojibake("## Analise Aquafast"),
+                "",
+                summary,
+                "",
+                source_note,
+                "",
+                markdown,
+                "",
+                repair_mojibake(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                cap_note,
+            ]
+        ).strip()
+    async def _try_legacy_ask(self, question: str) -> str | None:
+        """Respostas instantaneas via POST /ask quando a pergunta casa com legacy_question_to_sql na API."""
+        base = self.valves.API_BASE_URL.rstrip("/")
+        url = f"{base}/ask"
+        timeout = min(float(self.valves.LEGACY_ASK_TIMEOUT_SECONDS), float(self.valves.TIMEOUT_SECONDS))
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json={"question": question.strip()})
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        if not data.get("ok"):
+            return None
+        sql_hint = str(data.get("sql", "") or "")
+        return self._build_analysis_response(question, data, sql_hint)
+
     async def _run_data_pipeline(
         self,
         body: dict,
@@ -958,6 +1196,11 @@ class Pipe:
         chart: bool = False,
         sql_override: str | None = None,
     ) -> str:
+        if not export and sql_override is None:
+            legacy_reply = await self._try_legacy_ask(question)
+            if legacy_reply is not None:
+                return legacy_reply
+
         schema = await self._fetch_schema()
         schema_text = schema.get("summary_text", "")
         previous_sql = self._find_last_sql(body)
@@ -988,29 +1231,51 @@ class Pipe:
                     ]
                 )
 
-            result = await self._query_sql(sql, "Analise Scanntech")
+            sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+            result = await self._query_sql(sql_for_api, "Analise Aquafast")
         except httpx.HTTPStatusError as exc:
-            detail = str(exc.response.text)
-            if exc.response.status_code == 400:
-                repaired_sql = await self._repair_sql(body, question, schema_text, sql, detail)
-                if export:
-                    result = await self._export_sql(repaired_sql, "Exportacao Excel")
-                    download_url = result.get("download_url", "")
-                    return "\n".join(
-                        [
-                            "## Exportacao Excel",
-                            "",
-                            "Arquivo Excel gerado com sucesso.",
-                            f"[Baixar o arquivo]({download_url})",
-                            "",
-                            f"_Consulta executada: `{result.get('sql', repaired_sql)}`_",
-                            f"_Linhas exportadas: {result.get('row_count', 0)}_",
-                        ]
+            detail = str(exc.response.text) if exc.response is not None else ""
+            if exc.response is not None and exc.response.status_code == 400:
+                try:
+                    repaired_sql = await self._repair_sql(body, question, schema_text, sql, detail)
+                    if export:
+                        result = await self._export_sql(repaired_sql, "Exportacao Excel")
+                        download_url = result.get("download_url", "")
+                        return "\n".join(
+                            [
+                                "## Exportacao Excel",
+                                "",
+                                "Arquivo Excel gerado com sucesso.",
+                                f"[Baixar o arquivo]({download_url})",
+                                "",
+                                f"_Consulta executada: `{result.get('sql', repaired_sql)}`_",
+                                f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                            ]
+                        )
+                    sql = repaired_sql
+                    sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+                    result = await self._query_sql(sql_for_api, "Analise Aquafast")
+                except httpx.TimeoutException:
+                    return (
+                        "Timeout ao corrigir ou reexecutar o SQL (Ollama ou API demorou demais). "
+                        "Tente de novo em instantes; perguntas comuns respondem direto pela API sem LLM."
                     )
-                result = await self._query_sql(repaired_sql, "Analise Scanntech")
-                sql = repaired_sql
+                except httpx.HTTPStatusError as exc2:
+                    return self._http_status_error_message(exc2)
+                except Exception as fix_exc:
+                    fix_msg = str(fix_exc).strip()
+                    if len(fix_msg) > 400:
+                        fix_msg = fix_msg[:397] + "..."
+                    orig = detail.strip()
+                    if len(orig) > 500:
+                        orig = orig[:497] + "..."
+                    return (
+                        "Nao consegui executar a consulta apos tentar corrigir o SQL automaticamente.\n\n"
+                        f"Resposta da API na primeira tentativa: {orig or '(vazio)'}\n\n"
+                        f"Erro na segunda tentativa: {fix_msg}"
+                    )
             else:
-                raise
+                return self._http_status_error_message(exc)
 
         if export:
             # defensive fallback; normally handled earlier
@@ -1027,20 +1292,7 @@ class Pipe:
                 ]
             )
 
-        # Resumo deterministico: todos os numeros/percentuais sao calculados a partir de (columns, rows).
-        summary = self._deterministic_summary(question, result.get("columns", []), result.get("rows", []))
-        return "\n".join(
-            [
-                "## Analise Scanntech",
-                "",
-                summary,
-                "",
-                result.get("markdown", ""),
-                "",
-                f"_Consulta executada: `{result.get('sql', sql)}`_",
-                f"_Linhas retornadas: {result.get('row_count', 0)}_",
-            ]
-        )
+        return self._build_analysis_response(question, result, sql)
 
     def _render_chart(self, title: str, columns: list[str], rows: list[list[Any]]) -> str:
         if not rows:
@@ -1093,10 +1345,27 @@ class Pipe:
 
     async def pipe(self, body: dict):
         try:
+            # Proteção contra fallback silencioso para modelo base (qwen2.5)
+            # Se o usuário selecionar qwen2.5:latest em vez do pipe Scanntech Analyst,
+            # isso bloqueará a resposta e instruirá o redirecionamento.
+            model_name = body.get("model", "").lower()
+            if "qwen" in model_name and "scanntech_analyst" not in model_name and "analyst" not in model_name:
+                return (
+                    "⚠️ **ERRO: Modelo incorreto selecionado**\n\n"
+                    "Você selecionou `qwen2.5:latest` em vez de usar o pipe **Scanntech Analyst**.\n\n"
+                    "**O que fazer:**\n"
+                    "1. Clique no seletor de modelo no topo do chat\n"
+                    "2. Procure por **\"Scanntech Analyst\"** (não por \"qwen2.5\")\n"
+                    "3. Selecione **\"Scanntech Analyst\"**\n"
+                    "4. Envie sua pergunta novamente\n\n"
+                    "O Scanntech Analyst é o assistente especializado em análise dos dados Aquafast. "
+                    "Usando o modelo base diretamente, você perde acesso aos dados e às análises contextualizadas."
+                )
+
             question = self._extract_question(body)
             routing_text = question
             if not question:
-                return "Envie uma pergunta sobre os dados da Scanntech."
+                return "Envie uma pergunta sobre os dados da Aquafast."
 
             if self._is_access_question(routing_text):
                 return self._answer_access_question()
@@ -1145,7 +1414,7 @@ class Pipe:
                         return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
                     # pick month column
                     pick_mes = None
-                    for key in ["mes", "mês"]:
+                    for key in ["mes", "mÃªs"]:
                         for i, c in enumerate(lower):
                             if key == c or key in c:
                                 pick_mes = i
@@ -1164,7 +1433,7 @@ class Pipe:
                     cols, rows = last_table
                     lower = [c.lower() for c in cols]
                     pick_mes = None
-                    for key in ["mes", "mês"]:
+                    for key in ["mes", "mÃªs"]:
                         for i, c in enumerate(lower):
                             if key == c or key in c:
                                 pick_mes = i
@@ -1222,13 +1491,27 @@ class Pipe:
             return await self._run_data_pipeline(body, question, export=False)
         except httpx.TimeoutException:
             return (
-                "O modelo demorou demais para responder agora (timeout). "
-                "Tenta novamente em alguns segundos; se persistir, posso reduzir o uso do modelo e retornar so a tabela."
+                "Timeout: Ollama ou a API Aquafast demorou demais. "
+                "Se a pergunta for comum (ranking, vendas por mes, volume), ela deve cair na resposta rapida via API; "
+                "confira se o container da API e o Ollama estao de pe e os Valves de URL/timeout."
             )
+        except httpx.HTTPStatusError as exc:
+            return self._http_status_error_message(exc)
         except httpx.HTTPError as exc:
-            return f"Ocorreu um erro de rede ao consultar a stack ({type(exc).__name__})."
-        except Exception:
-            return "Opa! Houve um problema ao processar sua pergunta. Tenta de novo; se repetir, eu olho os logs e corrijo."
+            return (
+                f"Erro de rede ao falar com a stack: {type(exc).__name__}: {exc}\n\n"
+                "Verifique URL da API nos Valves do pipe e conectividade entre containers."
+            )
+        except Exception as exc:
+            detail = str(exc).strip()
+            if len(detail) > 280:
+                detail = detail[:277] + "..."
+            return (
+                "Opa! Houve um problema ao processar sua pergunta. "
+                f"Detalhe: {detail}\n\n"
+                "Se for SQL invalido ou coluna inexistente, reformule a pergunta ou tente uma das views: "
+                "ranking_clientes, ranking_produtos, vendas_por_mes, ms_mercado_aquafast, vendas_caixas_estado, top_produtos_categoria."
+            )
 
     async def _handle_chart(self, body: dict, question: str) -> str:
         schema = await self._fetch_schema()
@@ -1237,7 +1520,8 @@ class Pipe:
         if not sql:
             sql = await self._generate_sql(body, question, schema_text)
 
-        result = await self._query_sql(sql, "Grafico dos dados anteriores")
+        sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+        result = await self._query_sql(sql_for_api, "Grafico dos dados anteriores")
         chart = self._render_chart(result.get("title", "Grafico dos dados anteriores"), result.get("columns", []), result.get("rows", []))
         return "\n".join(
             [
@@ -1251,3 +1535,4 @@ class Pipe:
                 f"_Linhas retornadas: {result.get('row_count', 0)}_",
             ]
         )
+
