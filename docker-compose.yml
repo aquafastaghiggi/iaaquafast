@@ -51,8 +51,9 @@ services:
       - webui_data:/app/backend/data
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
-      - ENABLE_MODEL_FILTER=true
-      - MODEL_FILTER_LIST=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
+      # Leave model filtering disabled until scripts/doctor_openwebui.py reports OK.
+      # - ENABLE_MODEL_FILTER=true
+      # - MODEL_FILTER_LIST=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
       - WEBUI_SECRET_KEY=aquafast_secret_2026   # troque por uma chave segura
       - WEBUI_NAME=Aquafast IA                  # nome que aparece na interface
       # Padrão de trabalho do projeto: manter Scanntech Analyst como porta de entrada.
@@ -82,11 +83,11 @@ services:
     volumes:
       - ./:/workspace
     environment:
-      - AQUAFAST_MYSQL_HOST=host.docker.internal
-      - AQUAFAST_MYSQL_PORT=3306
-      - AQUAFAST_MYSQL_USER=root
-      - AQUAFAST_MYSQL_PASSWORD=k7m2y9u4
-      - AQUAFAST_MYSQL_DATABASE=scanntech
+      - AQUAFAST_MYSQL_HOST=${AQUAFAST_MYSQL_HOST:-host.docker.internal}
+      - AQUAFAST_MYSQL_PORT=${AQUAFAST_MYSQL_PORT:-3306}
+      - AQUAFAST_MYSQL_USER=${AQUAFAST_MYSQL_USER:?set AQUAFAST_MYSQL_USER in .env}
+      - AQUAFAST_MYSQL_PASSWORD=${AQUAFAST_MYSQL_PASSWORD:?set AQUAFAST_MYSQL_PASSWORD in .env}
+      - AQUAFAST_MYSQL_DATABASE=${AQUAFAST_MYSQL_DATABASE:?set AQUAFAST_MYSQL_DATABASE in .env}
     ports:
       - "8001:8000"
     restart: unless-stopped

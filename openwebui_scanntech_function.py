@@ -10,18 +10,47 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-import sys
-from pathlib import Path
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
 
-HELPER_PATH = Path("/tmp")
-if HELPER_PATH.exists() and str(HELPER_PATH) not in sys.path:
-    sys.path.insert(0, str(HELPER_PATH))
+try:
+    from aquafast_semantics import normalize_business_question, repair_mojibake
+except Exception:
+    def repair_mojibake(text: str) -> str:
+        if not isinstance(text, str):
+            return text
+        if not any(marker in text for marker in ("Ã", "Â", "ï¿½")):
+            return text
+        try:
+            repaired = text.encode("latin1").decode("utf-8")
+        except Exception:
+            return text
+        return repaired or text
 
-from aquafast_semantics import normalize_business_question, repair_mojibake
+
+    def normalize_business_question(text: str) -> str:
+        q = repair_mojibake(text)
+        q = unicodedata.normalize("NFKD", q)
+        q = q.encode("ascii", "ignore").decode("ascii")
+        q = " ".join(q.strip().lower().split())
+        replacements = (
+            (r"\bpontos de venda\b", "lojas"),
+            (r"\bpdv?s?\b", "lojas"),
+            (r"\bpresente hoje\b", "hoje"),
+            (r"\bpresenca hoje\b", "hoje"),
+            (r"\bconcorrente principal\b", "maior concorrente"),
+            (r"\bprincipal concorrente\b", "maior concorrente"),
+            (r"\bteriam mais potencial\b", "potencial de venda"),
+            (r"\bproduto[s]? com potencial\b", "potencial de venda"),
+            (r"\bo que vender\b", "potencial de venda"),
+            (r"\bmix\b", "categoria"),
+            (r"\bportifolio\b", "portfolio"),
+        )
+        for pattern, replacement in replacements:
+            q = re.sub(pattern, replacement, q)
+        return " ".join(q.split())
 
 
 class Pipe:
@@ -1535,4 +1564,3 @@ class Pipe:
                 f"_Linhas retornadas: {result.get('row_count', 0)}_",
             ]
         )
-
