@@ -136,10 +136,15 @@ def main() -> int:
     user = db_info.get("user") or {}
     chat = db_info.get("chat") or {}
 
-    cfg_models = ((cfg.get("ui") or {}).get("default_models"), (cfg.get("ui") or {}).get("default_model"))
+    cfg_ui = cfg.get("ui") or {}
     user_ui = user.get("ui") or {}
+    cfg_models = (cfg_ui.get("default_models"), cfg_ui.get("default_model"))
     user_models = (user_ui.get("models"), user_ui.get("selectedModel"), user_ui.get("defaultModel"))
     chat_models = chat.get("models")
+    cfg_prompt = cfg_ui.get("prompt_suggestions") or []
+    cfg_default_prompt = cfg_ui.get("default_prompt_suggestions") or []
+    user_prompt = user_ui.get("prompt_suggestions") or []
+    user_default_prompt = user_ui.get("default_prompt_suggestions") or []
 
     if PIPE_MODEL_ID in str(cfg_models):
         print_check("OK", "Config default", str(cfg_models))
@@ -155,6 +160,24 @@ def main() -> int:
         print_check("OK", "Chat reference", str(chat_models))
     else:
         print_check("WARN", "Chat reference", str(chat_models))
+
+    if cfg_prompt or cfg_default_prompt:
+        detail = f"config prompt={len(cfg_prompt)} default_prompt={len(cfg_default_prompt)}"
+        level = "OK" if len(cfg_prompt) >= 20 and len(cfg_default_prompt) >= 20 else "WARN"
+        print_check(level, "Config suggestions", detail)
+        if len(cfg_prompt) != len(cfg_default_prompt):
+            print_check("WARN", "Config suggestions mismatch", "prompt_suggestions and default_prompt_suggestions differ")
+    else:
+        print_check("WARN", "Config suggestions", "missing in config.ui")
+
+    if user_prompt or user_default_prompt:
+        detail = f"user prompt={len(user_prompt)} default_prompt={len(user_default_prompt)}"
+        level = "OK" if len(user_prompt) >= 20 and len(user_default_prompt) >= 20 else "WARN"
+        print_check(level, "User suggestions", detail)
+        if len(user_prompt) != len(user_default_prompt):
+            print_check("WARN", "User suggestions mismatch", "prompt_suggestions and default_prompt_suggestions differ")
+    else:
+        print_check("WARN", "User suggestions", "missing in user.ui")
 
     if compose_model_filter_active():
         print_check("WARN", "Compose model filter", "active; can hide models when the pipe fails")
@@ -173,7 +196,13 @@ def main() -> int:
     try:
         with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        print_check("OK", "Ollama /api/tags", f"{len(payload.get('models', []))} model(s)")
+        models = payload.get("models", [])
+        print_check("OK", "Ollama /api/tags", f"{len(models)} model(s)")
+        models_text = json.dumps(models, ensure_ascii=False).lower()
+        if "qwen2.5" in models_text:
+            print_check("OK", "qwen2.5 presence", "fallback model available")
+        else:
+            print_check("WARN", "qwen2.5 presence", "missing; free-chat fallback may be impaired, but predefinidas seguem operando")
     except urllib.error.HTTPError as exc:
         print_check("FAIL", "Ollama /api/tags", f"HTTP {exc.code}")
         issues.append("Ollama returned an HTTP error. Check the ollama container.")

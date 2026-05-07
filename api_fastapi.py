@@ -13,7 +13,7 @@ import json
 import re
 import unicodedata
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,11 @@ REPORT_SPECS: dict[str, dict[str, Any]] = {
         "title": "Vendas Aquafast por mes",
         "description": "Serie mensal do portifolio Aquafast em caixas e receita.",
         "sql": "SELECT * FROM vendas_por_mes ORDER BY mes",
+    },
+    "vendas_por_cidade": {
+        "title": "Vendas Aquafast por cidade",
+        "description": "Receita, caixas e unidades por cidade dentro do portfolio Aquafast.",
+        "sql": "SELECT * FROM vendas_por_cidade ORDER BY receita_total DESC",
     },
     "market_share_fabricante": {
         "title": "Market share Aquafast por fabricante",
@@ -129,7 +134,7 @@ def format_markdown(columns: list[str], rows: list[tuple[Any, ...]]) -> str:
     lines = [f"| {header} |", f"| {separator} |"]
 
     for row in rows:
-        values = [_format_ptbr_value(value) for value in row]
+        values = [_format_ptbr_value(column, value) for column, value in zip(columns, row)]
         lines.append(f"| {' | '.join(values)} |")
 
     return "\n".join(lines)
@@ -158,16 +163,48 @@ def _format_ptbr_number(value: float | int) -> str:
     return text.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _format_ptbr_value(value: Any) -> str:
+BOX_COUNT_COLUMNS = {
+    "caixa",
+    "caixas",
+    "caixas_vendidas",
+    "qtd_caixa",
+    "qtd_caixas",
+    "total_caixas",
+    "quantidade_caixas",
+}
+
+
+def _is_box_count_column(column: str | None) -> bool:
+    if not column:
+        return False
+    normalized = normalize(column)
+    if normalized in BOX_COUNT_COLUMNS:
+        return True
+    if normalized.endswith(" caixas") or normalized.endswith("_caixas"):
+        return True
+    return False
+
+
+def _round_half_up(value: float | int | Decimal) -> int:
+    return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _format_ptbr_value(column: str | None, value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
+        if _is_box_count_column(column):
+            return _format_ptbr_number(_round_half_up(value))
         return _format_ptbr_number(value)
     if isinstance(value, Decimal):
-        return _format_ptbr_number(float(value))
-    return repair_mojibake(str(value))
+        if _is_box_count_column(column):
+            return _format_ptbr_number(_round_half_up(value))
+        return _format_ptbr_number(value)
+    text = repair_mojibake(str(value))
+    text = "" if text is None else str(text)
+    return "" if text.strip().lower() == "none" else text
 
 
 def _build_source_note(question: str, title: str, sql: str) -> str:
@@ -379,7 +416,7 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             LEFT JOIN scanntech_produtos_raw p ON s.COD_PRODUTO = p.PROD_ID
             LEFT JOIN scanntech_clientes_raw c
               ON LOWER(TRIM(s.RAZAO_SOCIAL)) = LOWER(TRIM(COALESCE(c.PDV_SOCIAL_NAME, c.PDV_NAME)))
-            WHERE p.PROD_CATEGORY IN (SELECT DISTINCT PROD_CATEGORY FROM {PORTFOLIO_TABLE})
+            WHERE p.PROD_CATEGORY IN (SELECT DISTINCT PROD_CATEGORY FROM aquafast_portfolio)
             """,
             f"""
             CREATE OR REPLACE VIEW vendas_em_caixas AS
@@ -397,17 +434,18 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               m.loja,
               m.PDV_ID,
               m.is_aquafast,
+              ROUND(SUM(m.unidades), 0) AS unidades_scanntech,
               ROUND(SUM(m.unidades), 0) AS total_unidades,
               ROUND(SUM(m.unidades), 0) AS unidades,
               ROUND(SUM(m.receita), 2) AS total_receita,
               ROUND(SUM(m.receita), 2) AS receita,
               ap.QTDE_CX AS unidades_por_caixa,
-              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 1) AS total_caixas,
-              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 1) AS caixas,
+              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0) AS total_caixas,
+              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0) AS caixas,
               ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades), 0), 2) AS preco_medio_unitario,
               ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0), 2) AS preco_medio_caixa
             FROM mercado_aquafast m
-            LEFT JOIN {PORTFOLIO_TABLE} ap
+            LEFT JOIN aquafast_portfolio ap
               ON UPPER(TRIM(COALESCE(m.categoria, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
              AND UPPER(TRIM(COALESCE(m.litragem, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             GROUP BY
@@ -419,7 +457,8 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             CREATE OR REPLACE VIEW ranking_clientes AS
             SELECT
               loja AS cliente,
-              ROUND(SUM(caixas), 1) AS caixas_vendidas,
+              ROUND(SUM(unidades), 0) AS unidades_scanntech,
+              ROUND(SUM(caixas), 0) AS caixas_vendidas,
               ROUND(SUM(receita), 2) AS receita_total,
               ROUND(SUM(receita) / NULLIF(SUM(caixas), 0), 2) AS ticket_medio_caixa,
               MIN(MONTH_ID) AS primeira_compra,
@@ -436,8 +475,9 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               litragem,
               fabricante,
               marca,
+              ROUND(SUM(unidades), 0) AS unidades_scanntech,
               ROUND(SUM(unidades), 0) AS total_unidades,
-              ROUND(SUM(caixas), 1) AS caixas_vendidas,
+              ROUND(SUM(caixas), 0) AS caixas_vendidas,
               ROUND(SUM(receita), 2) AS receita_total,
               ROUND(SUM(receita) / NULLIF(SUM(caixas), 0), 2) AS preco_medio_caixa
             FROM vendas_em_caixas
@@ -448,7 +488,8 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             CREATE OR REPLACE VIEW vendas_por_mes AS
             SELECT
               SUBSTR(CAST(MONTH_ID AS VARCHAR), 1, 4) || '-' || SUBSTR(CAST(MONTH_ID AS VARCHAR), 5, 2) AS mes,
-              ROUND(SUM(caixas), 1) AS caixas_vendidas,
+              ROUND(SUM(unidades), 0) AS unidades_scanntech,
+              ROUND(SUM(caixas), 0) AS caixas_vendidas,
               ROUND(SUM(receita), 2) AS receita_total,
               COUNT(DISTINCT PDV_ID) AS pdvs_ativos,
               COUNT(DISTINCT categoria) AS categorias
@@ -509,6 +550,7 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               litragem,
               fabricante,
               is_aquafast,
+              ROUND(SUM(unidades), 0) AS unidades_scanntech,
               ROUND(SUM(caixas), 0) AS caixas_vendidas,
               ROUND(SUM(receita), 2) AS receita_total,
               COUNT(DISTINCT PDV_ID) AS pdvs
@@ -516,6 +558,23 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             WHERE is_aquafast = 1
             GROUP BY estado, categoria, litragem, fabricante, is_aquafast
             ORDER BY estado, categoria, caixas_vendidas DESC
+            """,
+            """
+            CREATE OR REPLACE VIEW vendas_por_cidade AS
+            SELECT
+              COALESCE(m.cidade, 'SEM CIDADE') AS cidade,
+              COALESCE(m.estado, 'SEM UF') AS estado,
+              COUNT(DISTINCT m.PDV_ID) AS pdvs,
+              ROUND(SUM(m.unidades), 0) AS unidades_scanntech,
+              ROUND(SUM(m.unidades / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(m.receita), 2) AS receita_total
+            FROM mercado_aquafast m
+            LEFT JOIN aquafast_portfolio ap
+              ON UPPER(TRIM(COALESCE(m.categoria, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(m.litragem, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+            WHERE m.is_aquafast = 1
+            GROUP BY COALESCE(m.cidade, 'SEM CIDADE'), COALESCE(m.estado, 'SEM UF')
+            ORDER BY receita_total DESC, caixas_vendidas DESC, cidade
             """,
             """
             CREATE OR REPLACE VIEW resumo_mercado_aquafast AS
@@ -539,13 +598,14 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               m.produto,
               m.fabricante,
               m.marca,
-              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 1) AS caixas_vendidas,
+              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0) AS caixas_vendidas,
+              ROUND(SUM(m.unidades), 0) AS unidades_scanntech,
               ROUND(SUM(m.unidades), 0) AS total_unidades,
               ROUND(SUM(m.receita), 2) AS total_receita,
               ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0), 2) AS preco_medio_caixa,
               COUNT(DISTINCT m.PDV_ID) AS pdvs_com_venda
             FROM mercado_aquafast m
-            LEFT JOIN {PORTFOLIO_TABLE} ap
+            LEFT JOIN aquafast_portfolio ap
               ON UPPER(TRIM(COALESCE(m.categoria, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
              AND UPPER(TRIM(COALESCE(m.litragem, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             WHERE m.is_aquafast = 1
@@ -560,7 +620,7 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               tipo_loja,
               COUNT(DISTINCT PDV_ID) AS total_lojas,
               COUNT(DISTINCT fabricante) AS fabricantes,
-              ROUND(SUM(caixas), 1) AS caixas_vendidas,
+              ROUND(SUM(caixas), 0) AS caixas_vendidas,
               ROUND(SUM(receita), 2) AS total_receita
             FROM vendas_em_caixas
             WHERE is_aquafast = 1
@@ -679,13 +739,19 @@ def _bootstrap_compatibility_views() -> None:
             CREATE TABLE ranking_clientes AS
             SELECT
               COALESCE(p.PDV_SOCIAL_NAME, p.PDV_NAME) AS cliente,
-              COUNT(*) AS total_pedidos,
-              ROUND(SUM(v.GROSS_SELLOUT), 2) AS valor_total,
-              ROUND(SUM(v.GROSS_SELLOUT) / NULLIF(COUNT(*), 0), 2) AS ticket_medio,
+              ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
+              ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(v.GROSS_SELLOUT), 2) AS receita_total,
+              ROUND(SUM(v.GROSS_SELLOUT) / NULLIF(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0), 2) AS ticket_medio_caixa,
               MIN(STR_TO_DATE(CONCAT(v.MONTH_ID, '01'), '%Y%m%d')) AS primeira_compra,
               MAX(STR_TO_DATE(CONCAT(v.MONTH_ID, '01'), '%Y%m%d')) AS ultima_compra
             FROM vta v
             JOIN pdv p ON v.PDV_ID = p.PDV_ID
+            JOIN prd pr ON v.PROD_ID = pr.PROD_ID
+            LEFT JOIN {PORTFOLIO_TABLE} ap
+              ON UPPER(TRIM(COALESCE(pr.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(pr.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+            WHERE pr.PROD_CATEGORY IS NOT NULL
             GROUP BY p.PDV_ID, p.PDV_SOCIAL_NAME, p.PDV_NAME
             """,
             """
@@ -698,11 +764,22 @@ def _bootstrap_compatibility_views() -> None:
             CREATE TABLE ranking_produtos AS
             SELECT
               pr.PROD_NAME AS produto,
-              COUNT(*) AS total_vendas,
-              ROUND(SUM(v.GROSS_SELLOUT), 2) AS receita_total
+              pr.PROD_CATEGORY AS categoria,
+              pr.PROD_CLASIF_2 AS litragem,
+              pr.PROD_MANUFACTURER AS fabricante,
+              pr.PROD_BRAND AS marca,
+              ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
+              ROUND(SUM(v.SALES_UNITS), 0) AS total_unidades,
+              ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(v.GROSS_SELLOUT), 2) AS receita_total,
+              ROUND(SUM(v.GROSS_SELLOUT) / NULLIF(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0), 2) AS preco_medio_caixa
             FROM vta v
             JOIN prd pr ON v.PROD_ID = pr.PROD_ID
-            GROUP BY pr.PROD_ID, pr.PROD_NAME
+            LEFT JOIN {PORTFOLIO_TABLE} ap
+              ON UPPER(TRIM(COALESCE(pr.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(pr.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+            WHERE pr.PROD_CATEGORY IS NOT NULL
+            GROUP BY pr.PROD_ID, pr.PROD_NAME, pr.PROD_CATEGORY, pr.PROD_CLASIF_2, pr.PROD_MANUFACTURER, pr.PROD_BRAND
             """,
             """
             DROP VIEW IF EXISTS vendas_por_mes
@@ -714,9 +791,15 @@ def _bootstrap_compatibility_views() -> None:
             CREATE TABLE vendas_por_mes AS
             SELECT
               DATE_FORMAT(STR_TO_DATE(CONCAT(MONTH_ID, '01'), '%Y%m%d'), '%Y-%m') AS mes,
-              COUNT(*) AS total_pedidos,
-              ROUND(SUM(GROSS_SELLOUT), 2) AS receita
-            FROM vta
+              ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
+              ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(v.GROSS_SELLOUT), 2) AS receita_total
+            FROM vta v
+            JOIN prd pr ON v.PROD_ID = pr.PROD_ID
+            LEFT JOIN {PORTFOLIO_TABLE} ap
+              ON UPPER(TRIM(COALESCE(pr.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(pr.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+            WHERE pr.PROD_CATEGORY IS NOT NULL
             GROUP BY MONTH_ID
             """,
             """
@@ -755,14 +838,44 @@ def _bootstrap_compatibility_views() -> None:
               d.PDV_STATE AS estado,
               COUNT(DISTINCT d.PDV_ID) AS total_pdvs,
               COUNT(DISTINCT p.PROD_MANUFACTURER) AS fabricantes,
-              ROUND(SUM(v.SALES_UNITS), 0) AS total_unidades,
-              ROUND(SUM(v.GROSS_SELLOUT), 2) AS total_receita
+              ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
+              ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(v.GROSS_SELLOUT), 2) AS receita_total
             FROM vta v
             JOIN pdv d ON v.PDV_ID = d.PDV_ID
             JOIN prd p ON v.PROD_ID = p.PROD_ID
+            LEFT JOIN {PORTFOLIO_TABLE} ap
+              ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(p.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             WHERE d.PDV_STATE IS NOT NULL
             GROUP BY d.PDV_STATE
-            ORDER BY total_receita DESC
+            ORDER BY receita_total DESC
+            """,
+            """
+            DROP VIEW IF EXISTS vendas_por_cidade
+            """,
+            """
+            DROP TABLE IF EXISTS vendas_por_cidade
+            """,
+            """
+            CREATE TABLE vendas_por_cidade AS
+            SELECT
+              COALESCE(d.PDV_LOCATION, 'SEM CIDADE') AS cidade,
+              COALESCE(d.PDV_STATE, 'SEM UF') AS estado,
+              COUNT(DISTINCT d.PDV_ID) AS pdvs,
+              ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
+              ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(v.GROSS_SELLOUT), 2) AS receita_total
+            FROM vta v
+            JOIN pdv d ON v.PDV_ID = d.PDV_ID
+            JOIN prd p ON v.PROD_ID = p.PROD_ID
+            LEFT JOIN {PORTFOLIO_TABLE} ap
+              ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(p.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+            WHERE d.PDV_LOCATION IS NOT NULL
+              AND p.PROD_CATEGORY IS NOT NULL
+            GROUP BY COALESCE(d.PDV_LOCATION, 'SEM CIDADE'), COALESCE(d.PDV_STATE, 'SEM UF')
+            ORDER BY receita_total DESC, caixas_vendidas DESC, cidade
             """,
             """
             DROP VIEW IF EXISTS ranking_redes
@@ -800,11 +913,16 @@ def _bootstrap_compatibility_views() -> None:
               p.PROD_BRAND AS marca,
               p.PROD_BARCODE AS ean,
               COUNT(DISTINCT v.PDV_ID) AS pdvs_com_venda,
+              ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
               ROUND(SUM(v.SALES_UNITS), 0) AS total_unidades,
+              ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
               ROUND(SUM(v.GROSS_SELLOUT), 2) AS total_receita,
-              ROUND(SUM(v.GROSS_SELLOUT) / NULLIF(SUM(v.SALES_UNITS), 0), 2) AS preco_medio
+              ROUND(SUM(v.GROSS_SELLOUT) / NULLIF(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0), 2) AS preco_medio_caixa
             FROM vta v
             JOIN prd p ON v.PROD_ID = p.PROD_ID
+            LEFT JOIN {PORTFOLIO_TABLE} ap
+              ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+             AND UPPER(TRIM(COALESCE(p.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             WHERE p.PROD_CATEGORY IS NOT NULL
             GROUP BY
               p.PROD_CATEGORY,
@@ -998,6 +1116,184 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
 
     q = normalize_business_question(question)
 
+    if any(term in q for term in ["ticket medio por cliente", "ticket por cliente", "ticket medio por cliente da aquafast"]):
+        return (
+            "Ticket medio por cliente Aquafast",
+            """
+            SELECT cliente, ticket_medio_caixa, unidades_scanntech, caixas_vendidas, receita_total, primeira_compra, ultima_compra
+            FROM ranking_clientes
+            ORDER BY ticket_medio_caixa DESC, receita_total DESC, cliente
+            LIMIT 20
+            """.strip(),
+        )
+
+    if any(term in q for term in ["ticket medio por produto", "ticket por produto", "ticket medio por produto da aquafast"]):
+        return (
+            "Ticket medio por produto Aquafast",
+            """
+            SELECT produto, preco_medio_caixa AS ticket_medio_caixa, unidades_scanntech, caixas_vendidas, receita_total, categoria, fabricante, marca
+            FROM ranking_produtos
+            ORDER BY preco_medio_caixa DESC, receita_total DESC, produto
+            LIMIT 20
+            """.strip(),
+        )
+
+    if any(term in q for term in ["ultima venda por produto", "ultimo valor por produto", "ultimo pedido por produto", "ultima venda do produto"]):
+        return (
+            "Ultima venda por produto Aquafast",
+            """
+            SELECT
+                codigo,
+                produto,
+                cliente,
+                data_venda,
+                qtd,
+                valor_unitario,
+                valor_total
+            FROM (
+                SELECT
+                    COD_PRODUTO AS codigo,
+                    DESC_PRODUTO AS produto,
+                    RAZAO_SOCIAL AS cliente,
+                    DATA_VENDA AS data_venda,
+                    ROUND(QTD, 0) AS qtd,
+                    ROUND(VALOR_UNITARIO, 2) AS valor_unitario,
+                    ROUND(VALOR_TOTAL, 2) AS valor_total,
+                    ROW_NUMBER() OVER (PARTITION BY COD_PRODUTO ORDER BY DATA_VENDA DESC, COD_PRODUTO DESC, CNPJ DESC) AS rn
+                FROM scanntech
+            ) last_sale
+            WHERE rn = 1
+            ORDER BY data_venda DESC, produto
+            LIMIT 50
+            """.strip(),
+        )
+
+    if any(term in q for term in ["primeira e ultima venda da base", "primeira venda da base", "ultima venda da base", "primeira e ultima venda"]):
+        return (
+            "Primeira e ultima venda da base Aquafast",
+            """
+            WITH ranked AS (
+                SELECT
+                    COD_PRODUTO AS codigo,
+                    DESC_PRODUTO AS produto,
+                    RAZAO_SOCIAL AS cliente,
+                    DATA_VENDA AS data_venda,
+                    ROUND(QTD, 0) AS qtd,
+                    ROUND(VALOR_UNITARIO, 2) AS valor_unitario,
+                    ROUND(VALOR_TOTAL, 2) AS valor_total,
+                    ROW_NUMBER() OVER (ORDER BY DATA_VENDA ASC, COD_PRODUTO ASC, CNPJ ASC) AS rn_first,
+                    ROW_NUMBER() OVER (ORDER BY DATA_VENDA DESC, COD_PRODUTO DESC, CNPJ DESC) AS rn_last
+                FROM scanntech
+            )
+            SELECT
+                'primeira venda' AS marco,
+                codigo,
+                produto,
+                cliente,
+                data_venda,
+                qtd,
+                valor_unitario,
+                valor_total
+            FROM ranked
+            WHERE rn_first = 1
+            UNION ALL
+            SELECT
+                'ultima venda' AS marco,
+                codigo,
+                produto,
+                cliente,
+                data_venda,
+                qtd,
+                valor_unitario,
+                valor_total
+            FROM ranked
+            WHERE rn_last = 1
+            ORDER BY data_venda
+            """.strip(),
+        )
+
+    if any(term in q for term in ["curva abc de produtos", "abc de produtos", "abc produtos"]):
+        return (
+            "Curva ABC de produtos Aquafast",
+            """
+            WITH base AS (
+                SELECT
+                    produto,
+                    categoria,
+                    fabricante,
+                    marca,
+                    unidades_scanntech,
+                    caixas_vendidas,
+                    receita_total,
+                    SUM(receita_total) OVER () AS receita_geral,
+                    SUM(receita_total) OVER (
+                        ORDER BY receita_total DESC, produto
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS receita_acumulada
+                FROM ranking_produtos
+            )
+            SELECT
+                produto,
+                categoria,
+                fabricante,
+                marca,
+                unidades_scanntech,
+                caixas_vendidas,
+                receita_total,
+                ROUND(receita_total / NULLIF(receita_geral, 0) * 100, 2) AS percentual_receita,
+                ROUND(receita_acumulada / NULLIF(receita_geral, 0) * 100, 2) AS percentual_acumulado,
+                CASE
+                    WHEN receita_acumulada / NULLIF(receita_geral, 0) <= 0.80 THEN 'A'
+                    WHEN receita_acumulada / NULLIF(receita_geral, 0) <= 0.95 THEN 'B'
+                    ELSE 'C'
+                END AS classe_abc
+            FROM base
+            ORDER BY receita_total DESC, produto
+            LIMIT 50
+            """.strip(),
+        )
+
+    if any(term in q for term in ["curva abc de clientes", "abc de clientes", "abc clientes"]):
+        return (
+            "Curva ABC de clientes Aquafast",
+            """
+            WITH base AS (
+                SELECT
+                    cliente,
+                    unidades_scanntech,
+                    caixas_vendidas,
+                    receita_total,
+                    ticket_medio_caixa,
+                    primeira_compra,
+                    ultima_compra,
+                    SUM(receita_total) OVER () AS receita_geral,
+                    SUM(receita_total) OVER (
+                        ORDER BY receita_total DESC, cliente
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS receita_acumulada
+                FROM ranking_clientes
+            )
+            SELECT
+                cliente,
+                unidades_scanntech,
+                caixas_vendidas,
+                receita_total,
+                ticket_medio_caixa,
+                primeira_compra,
+                ultima_compra,
+                ROUND(receita_total / NULLIF(receita_geral, 0) * 100, 2) AS percentual_receita,
+                ROUND(receita_acumulada / NULLIF(receita_geral, 0) * 100, 2) AS percentual_acumulado,
+                CASE
+                    WHEN receita_acumulada / NULLIF(receita_geral, 0) <= 0.80 THEN 'A'
+                    WHEN receita_acumulada / NULLIF(receita_geral, 0) <= 0.95 THEN 'B'
+                    ELSE 'C'
+                END AS classe_abc
+            FROM base
+            ORDER BY receita_total DESC, cliente
+            LIMIT 50
+            """.strip(),
+        )
+
     m_top_cli = re.search(r"\btop\s+(\d+)\s+clientes", q)
     if m_top_cli:
         n = min(max(int(m_top_cli.group(1)), 1), 200)
@@ -1036,10 +1332,75 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
     if any(term in q for term in ["top 20 clientes", "clientes por valor", "ranking clientes", "clientes que mais compraram", "valor total dos clientes"]):
         return "Top clientes Aquafast por caixa", "SELECT * FROM ranking_clientes ORDER BY caixas_vendidas DESC, receita_total DESC, cliente LIMIT 20"
 
-    if any(term in q for term in ["top 20 produtos", "produtos mais vendidos", "ranking produtos", "produtos por receita"]):
+    if any(term in q for term in ["clientes com maior faturamento", "faturamento por cliente", "ranking de clientes por faturamento", "clientes aquafast com maior faturamento"]):
+        return (
+            "Clientes com maior faturamento Aquafast",
+            """
+            SELECT cliente, unidades_scanntech, caixas_vendidas, receita_total, ticket_medio_caixa, primeira_compra, ultima_compra
+            FROM ranking_clientes
+            ORDER BY receita_total DESC, caixas_vendidas DESC, cliente
+            LIMIT 20
+            """.strip(),
+        )
+
+    if any(term in q for term in ["clientes com menor compra", "menor compra", "clientes aquafast com menor compra"]):
+        return (
+            "Clientes com menor compra Aquafast",
+            """
+            SELECT cliente, unidades_scanntech, caixas_vendidas, receita_total, ticket_medio_caixa, primeira_compra, ultima_compra
+            FROM ranking_clientes
+            ORDER BY caixas_vendidas ASC, receita_total ASC, cliente
+            LIMIT 20
+            """.strip(),
+        )
+
+    if any(term in q for term in ["ticket medio por cliente", "ticket por cliente", "ticket medio por cliente da aquafast"]):
+        return (
+            "Ticket medio por cliente Aquafast",
+            """
+            SELECT cliente, ticket_medio_caixa, unidades_scanntech, caixas_vendidas, receita_total, primeira_compra, ultima_compra
+            FROM ranking_clientes
+            ORDER BY ticket_medio_caixa DESC, receita_total DESC, cliente
+            LIMIT 20
+            """.strip(),
+        )
+
+    if any(term in q for term in ["top 20 produtos", "produtos mais vendidos", "ranking produtos"]):
         return "Top produtos Aquafast por caixa", "SELECT * FROM ranking_produtos ORDER BY caixas_vendidas DESC, receita_total DESC, produto LIMIT 20"
 
-    if any(term in q for term in ["market share", "participacao", "participação", "fabricantes", "marcas", "marca"]):
+    if any(term in q for term in ["produtos por faturamento", "produtos aquafast por faturamento", "faturamento por produto", "produtos por receita", "ranking de receita por produto", "ranking de faturamento"]):
+        return (
+            "Receita por produto Aquafast (top 30)",
+            """
+            SELECT produto, unidades_scanntech, caixas_vendidas, receita_total, categoria, fabricante, marca
+            FROM ranking_produtos
+            ORDER BY receita_total DESC, caixas_vendidas DESC, produto
+            LIMIT 30
+            """.strip(),
+        )
+
+    if any(
+        term in q
+        for term in [
+            "produtos por quantidade",
+            "produtos aquafast por quantidade",
+            "mais vendidos em quantidade",
+            "maior volume de vendas",
+            "produtos com maior volume",
+            "mais unidades vendidas",
+        ]
+    ):
+        return (
+            "Produtos com maior volume (caixas)",
+            """
+            SELECT produto, unidades_scanntech, caixas_vendidas, receita_total, categoria, fabricante, marca
+            FROM ranking_produtos
+            ORDER BY unidades_scanntech DESC, caixas_vendidas DESC, receita_total DESC, produto
+            LIMIT 50
+            """.strip(),
+        )
+
+    if any(term in q for term in ["market share", "participacao", "participa????o", "fabricantes", "marcas", "marca"]):
         return (
             "Market share Aquafast por fabricante",
             "SELECT * FROM ms_mercado_aquafast ORDER BY total_receita DESC LIMIT 20",
@@ -1049,6 +1410,12 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
         return (
             "Vendas Aquafast por estado",
             "SELECT * FROM vendas_caixas_estado ORDER BY receita_total DESC",
+        )
+
+    if any(term in q for term in ["cidade", "vendas por cidade"]):
+        return (
+            "Vendas Aquafast por cidade",
+            "SELECT * FROM vendas_por_cidade ORDER BY receita_total DESC, caixas_vendidas DESC, cidade",
         )
 
     if any(term in q for term in ["rede", "bandeira", "ranking de redes"]):
@@ -1063,37 +1430,40 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             "SELECT * FROM top_produtos_categoria ORDER BY caixas_vendidas DESC LIMIT 50",
         )
 
-    if any(
-        term in q
-        for term in [
-            "vendas por mes",
-            "vendas por mês",
-            "evolucao mensal",
-            "evolução mensal",
-            "receita por mes",
-            "receita por mês",
-            "serie mensal",
-            "série mensal",
-            "historico mensal",
-            "histórico mensal",
-            "comparativo mensal",
-        ]
+    if (
+        ("vendas" in q and "aquafast" in q and ("mes" in q or "mensal" in q))
+        or any(
+            term in q
+            for term in [
+                "vendas por mes",
+                "vendas por m??s",
+                "evolucao mensal",
+                "evolu????o mensal",
+                "receita por mes",
+                "receita por m??s",
+                "serie mensal",
+                "s??rie mensal",
+                "historico mensal",
+                "hist??rico mensal",
+                "comparativo mensal",
+            ]
+        )
     ):
         return "Vendas Aquafast por mes", "SELECT * FROM vendas_por_mes ORDER BY mes"
 
-    if any(term in q for term in ["ultimos 12 meses", "últimos 12 meses", "ultimo ano", "último ano", "12 meses de vendas"]):
+    if any(term in q for term in ["ultimos 12 meses", "??ltimos 12 meses", "ultimo ano", "??ltimo ano", "12 meses de vendas"]):
         return (
             "Ultimos 12 meses (vendas Aquafast por mes)",
             "SELECT * FROM vendas_por_mes ORDER BY mes DESC LIMIT 12",
         )
 
-    if any(term in q for term in ["ultimos 6 meses", "últimos 6 meses", "6 meses de vendas"]):
+    if any(term in q for term in ["ultimos 6 meses", "??ltimos 6 meses", "6 meses de vendas"]):
         return (
             "Ultimos 6 meses (vendas Aquafast por mes)",
             "SELECT * FROM vendas_por_mes ORDER BY mes DESC LIMIT 6",
         )
 
-    if any(term in q for term in ["potencial de venda", "mais potencial", "teriam mais potencial", "o que vender", "produto com potencial", "produtos com potencial", "distribuicao", "distribuição"]):
+    if any(term in q for term in ["potencial de venda", "mais potencial", "teriam mais potencial", "o que vender", "produto com potencial", "produtos com potencial", "distribuicao", "distribui????o"]):
         return (
             "Produtos Aquafast com maior potencial de venda",
             """
@@ -1112,19 +1482,19 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             """.strip(),
         )
 
-    if any(term in q for term in ["pontos de venda", "ponto de venda", "pdv", "presentes hoje", "presente hoje", "presença hoje", "presenca hoje"]):
+    if any(term in q for term in ["pontos de venda", "ponto de venda", "pdv", "presentes hoje", "presente hoje", "presen??a hoje", "presenca hoje", "quantas lojas", "em quantos lojas", "lojas presentes"]):
         return (
             "Total de pontos de venda Aquafast",
             "SELECT COUNT(*) AS total_pontos_de_venda FROM ranking_clientes",
         )
 
-    if any(term in q for term in ["quantos clientes", "quantas lojas", "numero de clientes", "número de clientes", "total de clientes", "quantos pdvs"]):
+    if any(term in q for term in ["quantos clientes", "quantas lojas", "quantos lojas", "em quantos lojas", "numero de clientes", "n??mero de clientes", "total de clientes", "quantos pdvs", "presente hoje"]):
         return (
             "Total de lojas Aquafast",
             "SELECT COUNT(*) AS total_lojas FROM ranking_clientes",
         )
 
-    if any(term in q for term in ["quantos produtos", "numero de produtos", "número de produtos", "total de produtos distintos", "quantos skus"]):
+    if any(term in q for term in ["quantos produtos", "numero de produtos", "n??mero de produtos", "total de produtos distintos", "quantos skus", "produtos aquafast"]):
         return (
             "Total de produtos Aquafast",
             "SELECT COUNT(DISTINCT produto) AS total_produtos FROM ranking_produtos",
@@ -1151,7 +1521,7 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             """.strip(),
         )
 
-    if any(term in q for term in ["ticket medio ponderado", "ticket médio ponderado", "ticket medio geral", "ticket médio geral"]):
+    if any(term in q for term in ["ticket medio ponderado", "ticket m??dio ponderado", "ticket medio geral", "ticket m??dio geral"]):
         return (
             "Ticket medio por caixa Aquafast",
             """
@@ -1166,47 +1536,16 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
         return (
             "Lojas com mais caixas (frequencia)",
             """
-            SELECT cliente, caixas_vendidas, receita_total, ticket_medio_caixa, primeira_compra, ultima_compra
+            SELECT cliente, unidades_scanntech, caixas_vendidas, receita_total, ticket_medio_caixa, primeira_compra, ultima_compra
             FROM ranking_clientes
             ORDER BY caixas_vendidas DESC, receita_total DESC
             LIMIT 50
             """.strip(),
         )
 
-    if any(
-        term in q
-        for term in [
-            "produtos por quantidade",
-            "mais vendidos em quantidade",
-            "maior volume de vendas",
-            "produtos com maior volume",
-            "mais unidades vendidas",
-        ]
-    ):
+    if any(term in q for term in ["sem compra", "90 dias", "churn", "clientes sem compra", "lojas sem compra"]):
         return (
-            "Produtos com maior volume (caixas)",
-            """
-            SELECT produto, caixas_vendidas, receita_total
-            FROM ranking_produtos
-            ORDER BY caixas_vendidas DESC, receita_total DESC
-            LIMIT 50
-            """.strip(),
-        )
-
-    if any(term in q for term in ["receita por produto", "faturamento por produto", "produtos por receita", "ranking de receita por produto"]):
-        return (
-            "Receita por produto Aquafast (top 30)",
-            """
-            SELECT produto, caixas_vendidas, receita_total
-            FROM ranking_produtos
-            ORDER BY receita_total DESC, caixas_vendidas DESC
-            LIMIT 30
-            """.strip(),
-        )
-
-    if any(term in q for term in ["sem compra", "90 dias", "churn"]):
-        return (
-            "Lojas sem compra há mais de 90 dias",
+            "Lojas sem compra h?? mais de 90 dias",
             """
             SELECT cliente, ultima_compra, caixas_vendidas, receita_total
             FROM ranking_clientes
@@ -1216,11 +1555,11 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             """.strip(),
         )
 
-    if any(term in q for term in ["1 compra", "uma compra", "apenas uma compra", "risco de churn"]):
+    if any(term in q for term in ["1 compra", "uma compra", "apenas uma compra", "risco de churn", "clientes com apenas 1 compra"]):
         return (
             "Lojas com apenas 1 compra",
             """
-            SELECT cliente, caixas_vendidas, receita_total, primeira_compra, ultima_compra
+            SELECT cliente, unidades_scanntech, caixas_vendidas, receita_total, primeira_compra, ultima_compra
             FROM ranking_clientes
             WHERE caixas_vendidas = 1
             ORDER BY receita_total DESC
@@ -1228,7 +1567,7 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             """.strip(),
         )
 
-    if any(term in q for term in ["resumo geral", "resumo do arquivo", "visao geral", "visão geral"]):
+    if any(term in q for term in ["resumo geral", "resumo do arquivo", "visao geral", "vis??o geral"]):
         return (
             "Resumo geral Aquafast",
             """
@@ -1249,7 +1588,6 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
     raise ValueError(
         "Nao identifiquei uma consulta suportada. Use SQL direto ou use a IA do chat para gerar a consulta."
     )
-
 
 def get_schema_snapshot() -> dict[str, Any]:
     con = open_connection()

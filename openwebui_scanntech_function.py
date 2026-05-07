@@ -53,6 +53,111 @@ except Exception:
         return " ".join(q.split())
 
 
+AVAILABLE_QUESTION_SUGGESTIONS: tuple[dict[str, str], ...] = (
+    {
+        "title": "Lojas com 1 compra",
+        "content": "Mostre as lojas da Aquafast com apenas 1 compra",
+    },
+    {
+        "title": "Redes com Aquafast",
+        "content": "Mostre as redes que vendem Aquafast",
+    },
+    {
+        "title": "Vendas por estado",
+        "content": "Mostre as vendas da Aquafast por estado",
+    },
+    {
+        "title": "Top lojas Aquafast",
+        "content": "Mostre o top de lojas Aquafast por caixa",
+    },
+    {
+        "title": "Quantas lojas a Aquafast tem hoje?",
+        "content": "Quantas lojas a Aquafast tem hoje?",
+    },
+    {
+        "title": "Em quantos pontos de venda a Aquafast está presente hoje?",
+        "content": "Em quantos pontos de venda a Aquafast está presente hoje?",
+    },
+    {
+        "title": "Qual o maior concorrente da Aquafast?",
+        "content": "Qual o maior concorrente da Aquafast?",
+    },
+    {
+        "title": "Quais produtos teriam mais potencial de venda?",
+        "content": "Quais produtos teriam mais potencial de venda?",
+    },
+    {
+        "title": "Top 20 produtos mais vendidos",
+        "content": "Top 20 produtos mais vendidos",
+    },
+    {
+        "title": "Top 20 clientes por valor",
+        "content": "Top 20 clientes por valor",
+    },
+    {
+        "title": "Vendas por mês",
+        "content": "Mostre as vendas da Aquafast por mês",
+    },
+    {
+        "title": "Vendas por cidade",
+        "content": "Mostre as vendas da Aquafast por cidade",
+    },
+    {
+        "title": "Vendas por UF",
+        "content": "Mostre as vendas da Aquafast por UF",
+    },
+    {
+        "title": "Produtos por faturamento",
+        "content": "Mostre os produtos Aquafast por faturamento",
+    },
+    {
+        "title": "Produtos por quantidade",
+        "content": "Mostre os produtos Aquafast por quantidade",
+    },
+    {
+        "title": "Clientes com maior faturamento",
+        "content": "Mostre os clientes com maior faturamento da Aquafast",
+    },
+    {
+        "title": "Clientes com menor compra",
+        "content": "Mostre os clientes com menor compra da Aquafast",
+    },
+    {
+        "title": "Ticket médio por cliente",
+        "content": "Mostre o ticket médio por cliente da Aquafast",
+    },
+    {
+        "title": "Ticket médio por produto",
+        "content": "Mostre o ticket médio por produto da Aquafast",
+    },
+    {
+        "title": "Última venda por produto",
+        "content": "Mostre a última venda por produto da Aquafast",
+    },
+    {
+        "title": "Primeira e última venda da base",
+        "content": "Mostre a primeira e a última venda da base Aquafast",
+    },
+    {
+        "title": "Curva ABC de produtos",
+        "content": "Mostre a curva ABC de produtos da Aquafast",
+    },
+    {
+        "title": "Curva ABC de clientes",
+        "content": "Mostre a curva ABC de clientes da Aquafast",
+    },
+)
+
+PRIMARY_QUESTION_PROMPTS: tuple[str, ...] = (
+    "Mostre os produtos Aquafast por faturamento",
+    "Top 20 produtos mais vendidos",
+    "Top 20 clientes por valor",
+    "Mostre as vendas da Aquafast por mês",
+    "Mostre as vendas da Aquafast por cidade",
+    "Mostre a curva ABC de produtos da Aquafast",
+)
+
+
 class Pipe:
     # Invariante do projeto:
     # - O nome visivel e a porta de entrada principal precisam permanecer como "Scanntech Analyst".
@@ -208,6 +313,102 @@ class Pipe:
 
     def _contains_any(self, text: str, terms: list[str]) -> bool:
         return any(term in text for term in terms)
+
+    def _safe_text(self, value: Any, default: str = "") -> str:
+        if value is None:
+            return default
+        text = repair_mojibake(value) if isinstance(value, str) else str(value)
+        if text is None:
+            return default
+        cleaned = str(text).strip()
+        if not cleaned or cleaned.lower() == "none":
+            return default
+        return cleaned
+
+    def _selected_questions(self, limit: int | None = None) -> list[dict[str, str]]:
+        items = [
+            {
+                "title": self._safe_text(item.get("title", ""), ""),
+                "content": self._safe_text(item.get("content", ""), ""),
+            }
+            for item in AVAILABLE_QUESTION_SUGGESTIONS
+        ]
+        if limit is None:
+            return items
+
+        normalized_items = [
+            (self._normalize_text(item["title"]), self._normalize_text(item["content"]), item)
+            for item in items
+        ]
+        selected: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        for prompt in PRIMARY_QUESTION_PROMPTS:
+            normalized_prompt = self._normalize_text(prompt)
+            for title_norm, content_norm, item in normalized_items:
+                key = self._normalize_text(item["content"] or item["title"])
+                if normalized_prompt in {title_norm, content_norm, key} and key not in seen:
+                    selected.append(item)
+                    seen.add(key)
+                    break
+            if len(selected) >= limit:
+                return selected[:limit]
+
+        for item in items:
+            key = self._normalize_text(item["content"] or item["title"])
+            if key in seen:
+                continue
+            selected.append(item)
+            seen.add(key)
+            if len(selected) >= limit:
+                break
+
+        return selected[:limit]
+
+    def _format_questions_block(self, limit: int | None = None) -> str:
+        selected = self._selected_questions(limit=limit)
+        lines = ["Perguntas disponíveis:", ""]
+        for idx, item in enumerate(selected, start=1):
+            title = self._safe_text(item.get("title", ""), "Pergunta")
+            content = self._safe_text(item.get("content", ""), title)
+            if limit is None:
+                lines.append(f"{idx}. {title}")
+                if content and content != title:
+                    lines.append(f"   {content}")
+            else:
+                lines.append(f"- `{content}`")
+        lines.append("")
+        lines.append("Digite: `Mostrar perguntas disponíveis`")
+        return "\n".join(lines).strip()
+
+    def _is_available_questions_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return self._contains_any(
+            q,
+            [
+                "mostrar perguntas disponiveis",
+                "quais perguntas posso fazer",
+                "listar sugestoes",
+                "mostrar sugestoes",
+                "perguntas disponiveis",
+                "sugestoes disponiveis",
+            ],
+        )
+
+    def _answer_available_questions(self) -> str:
+        lines = ["## Perguntas disponíveis", ""]
+        for idx, item in enumerate(AVAILABLE_QUESTION_SUGGESTIONS, start=1):
+            title = repair_mojibake(item["title"])
+            content = repair_mojibake(item["content"])
+            lines.append(f"{idx}. {title}")
+            if content and content != title:
+                lines.append(f"   {content}")
+        lines.append("")
+        lines.append(
+            "Se quiser ver a lista completa na interface, clique em uma sugestão ou pergunte: "
+            '"Mostrar perguntas disponíveis".'
+        )
+        return "\n".join(lines).strip()
 
     def _looks_like_edit_request(self, question: str) -> bool:
         q = self._normalize_text(question)
@@ -1372,6 +1573,149 @@ class Pipe:
         ]
         return "\n".join(chart_lines)
 
+    def _answer_available_questions(self) -> str:
+        return self._format_questions_block(limit=None)
+
+    def _format_metric(self, value: float, metric_col: str | None) -> str:
+        metric = self._normalize_text(metric_col or "")
+        if any(k in metric for k in ["receita", "faturamento", "valor total", "valor_total"]):
+            return f"R$ {self._format_ptbr_number(value)}"
+        if metric in {"caixa", "caixas", "caixas_vendidas", "qtd_caixa", "qtd_caixas", "total_caixas", "quantidade_caixas"} or metric.endswith("_caixas"):
+            rounded = int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            return self._format_ptbr_number(rounded)
+        if value.is_integer():
+            return self._format_ptbr_number(int(value))
+        return self._format_ptbr_number(value)
+
+    def _deterministic_summary(self, question: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "Nenhum resultado encontrado para essa consulta."
+
+        metric_col = self._pick_metric_column(question, columns, rows)
+        label_col = self._pick_label_column(columns, rows, metric_col)
+        if not metric_col or metric_col not in columns:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        metric_idx = columns.index(metric_col)
+        label_idx = columns.index(label_col) if label_col in columns else 0
+
+        if len(rows) == 1:
+            row = rows[0]
+            metric_value = self._as_float(row[metric_idx])
+            if metric_value is not None:
+                formatted = self._format_metric(metric_value, metric_col)
+                if label_col in columns and label_col != metric_col:
+                    label_value = self._safe_text(row[label_idx], "Resultado")
+                    return f"{label_value}: {formatted}"
+                return f"{metric_col}: {formatted}"
+
+        points = []
+        for row in rows:
+            m = self._as_float(row[metric_idx])
+            if m is None:
+                continue
+            points.append((self._safe_text(row[label_idx], f"Item {len(points) + 1}"), m))
+
+        if not points:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        points.sort(key=lambda x: x[1], reverse=True)
+        total = sum(v for _, v in points)
+        top = points[:3]
+        lines = []
+        lines.append(f"Metricas: `{metric_col}` (ordenado desc).")
+        lines.append("Top 3:")
+        for i, (name, v) in enumerate(top, start=1):
+            lines.append(f"{i}. {name} - {self._format_metric(v, metric_col)}")
+        if total > 0 and len(points) >= 3:
+            share = sum(v for _, v in top) / total * 100.0
+            lines.append(f"Participacao do top 3 no total listado: {share:.1f}%")
+        return "\n".join(lines)
+
+    def _build_analysis_response(self, question: str, result: dict[str, Any], sql_hint: str) -> str:
+        summary = self._safe_text(
+            self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])),
+            "Resultado retornado. Veja a tabela abaixo.",
+        )
+        source_note = self._safe_text(
+            self._source_note_from_result(question, result),
+            "Fonte: consulta local no DuckDB usando as views semanticas da Aquafast.",
+        )
+        markdown = self._safe_text(result.get("markdown", ""), "_Nenhum resultado encontrado._")
+        cap_note = ""
+        if result.get("truncated"):
+            cap = result.get("row_cap")
+            cap_note = repair_mojibake(
+                f"\n\n_Amostra limitada pela API ({cap} linhas no maximo). "
+                "Refine a pergunta com filtros (mes, cliente, produto) ou use LIMIT menor no SQL para ver tudo no Excel._"
+            )
+        questions_block = self._format_questions_block(limit=6)
+        return "\n".join(
+            [
+                repair_mojibake("## Analise Aquafast"),
+                "",
+                summary,
+                "",
+                source_note,
+                "",
+                markdown,
+                "",
+                repair_mojibake(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                cap_note,
+                "",
+                questions_block,
+            ]
+        ).strip()
+
+    def _render_chart(self, title: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "_Nenhum dado encontrado para montar o grafico._"
+
+        labels = ["cliente", "produto", "mes", "periodo", "categoria", "name"]
+        values = ["valor_total", "receita_total", "receita", "total_vendas", "total_pedidos", "qtd", "quantity"]
+
+        lower_map = {column.lower(): column for column in columns}
+        label_col = next((original for key in labels for lower, original in lower_map.items() if key == lower or key in lower), None)
+        value_col = next((original for key in values for lower, original in lower_map.items() if key == lower or key in lower), None)
+
+        if not label_col and columns:
+            label_col = columns[0]
+        if not value_col and len(columns) > 1:
+            value_col = columns[1]
+
+        if not label_col or not value_col:
+            return "_Nao foi possivel identificar colunas para o grafico._"
+
+        label_idx = columns.index(label_col)
+        value_idx = columns.index(value_col)
+        points = []
+        for row in rows[:12]:
+            label = self._safe_text(row[label_idx], "Item")
+            value = row[value_idx]
+            try:
+                numeric = float(value)
+            except Exception:
+                continue
+            points.append((label, numeric))
+
+        if not points:
+            return "_Nao encontrei valores numericos suficientes para montar o grafico._"
+
+        max_value = max(v for _, v in points)
+        if max_value <= 0:
+            max_value = 1.0
+
+        chart_lines = [
+            "```mermaid",
+            "xychart-beta",
+            f'    title "{self._safe_text(title, "Grafico")}"',
+            f'    x-axis {json.dumps([label for label, _ in points], ensure_ascii=False)}',
+            f'    y-axis "{value_col}" 0 --> {int(max_value * 1.1) if max_value > 0 else 1}',
+            f"    bar {json.dumps([round(value, 2) for _, value in points], ensure_ascii=False)}",
+            "```",
+        ]
+        return "\n".join(chart_lines)
+
     async def pipe(self, body: dict):
         try:
             # Proteção contra fallback silencioso para modelo base (qwen2.5)
@@ -1398,6 +1742,9 @@ class Pipe:
 
             if self._is_access_question(routing_text):
                 return self._answer_access_question()
+
+            if self._is_available_questions_request(routing_text):
+                return self._answer_available_questions()
 
             if self._is_explicit_chat_question(routing_text):
                 return await self._ask_chat(body, question)
