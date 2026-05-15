@@ -43,7 +43,16 @@ def container_running(name: str) -> bool:
 
 
 def docker_exec_python(container: str, code: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    return run(["docker", "exec", container, "python", "-c", code], timeout=timeout)
+    return subprocess.run(
+        ["docker", "exec", "-i", container, "python", "-"],
+        input=code,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
 
 
 def check_webui_db() -> dict[str, object]:
@@ -70,6 +79,43 @@ user_row = cur.execute("SELECT settings FROM user LIMIT 1").fetchone()
 result["user"] = json.loads(user_row[0]) if user_row and user_row[0] else {{}}
 chat_row = cur.execute("SELECT chat FROM chat ORDER BY updated_at DESC LIMIT 1").fetchone()
 result["chat"] = json.loads(chat_row[0]) if chat_row and chat_row[0] else {{}}
+print(json.dumps(result, ensure_ascii=False))
+conn.close()
+"""
+    return json.loads(docker_exec_python(WEBUI_CONTAINER, code, timeout=60).stdout)
+
+
+def check_webui_timestamps() -> dict[str, object]:
+    code = """
+import json
+import sqlite3
+
+db_path = "/app/backend/data/webui.db"
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+def table_report(table_name: str, columns: list[str]) -> dict[str, object]:
+    info = cur.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+    existing = {row[1] for row in info}
+    report: dict[str, object] = {}
+    for column in columns:
+        if column not in existing:
+            continue
+        if table_name == "user":
+            wrong_count = cur.execute(
+                f'SELECT COUNT(*) FROM "{table_name}" WHERE typeof("{column}") != "integer" AND "{column}" IS NOT NULL'
+            ).fetchone()[0]
+        else:
+            wrong_count = cur.execute(
+                f'SELECT COUNT(*) FROM "{table_name}" WHERE typeof("{column}") != "text" AND "{column}" IS NOT NULL'
+            ).fetchone()[0]
+        report[column] = int(wrong_count)
+    return report
+
+result = {
+    "user": table_report("user", ["created_at", "updated_at", "last_active_at"]),
+    "config": table_report("config", ["created_at", "updated_at"]),
+}
 print(json.dumps(result, ensure_ascii=False))
 conn.close()
 """
@@ -135,6 +181,7 @@ def main() -> int:
     cfg = db_info.get("config") or {}
     user = db_info.get("user") or {}
     chat = db_info.get("chat") or {}
+    timestamp_info = check_webui_timestamps()
 
     cfg_ui = cfg.get("ui") or {}
     user_ui = user.get("ui") or {}
@@ -163,7 +210,7 @@ def main() -> int:
 
     if cfg_prompt or cfg_default_prompt:
         detail = f"config prompt={len(cfg_prompt)} default_prompt={len(cfg_default_prompt)}"
-        level = "OK" if len(cfg_prompt) >= 20 and len(cfg_default_prompt) >= 20 else "WARN"
+        level = "OK" if len(cfg_prompt) == 5 and len(cfg_default_prompt) == 5 else "WARN"
         print_check(level, "Config suggestions", detail)
         if len(cfg_prompt) != len(cfg_default_prompt):
             print_check("WARN", "Config suggestions mismatch", "prompt_suggestions and default_prompt_suggestions differ")
@@ -172,12 +219,26 @@ def main() -> int:
 
     if user_prompt or user_default_prompt:
         detail = f"user prompt={len(user_prompt)} default_prompt={len(user_default_prompt)}"
-        level = "OK" if len(user_prompt) >= 20 and len(user_default_prompt) >= 20 else "WARN"
+        level = "OK" if len(user_prompt) == 5 and len(user_default_prompt) == 5 else "WARN"
         print_check(level, "User suggestions", detail)
         if len(user_prompt) != len(user_default_prompt):
             print_check("WARN", "User suggestions mismatch", "prompt_suggestions and default_prompt_suggestions differ")
     else:
         print_check("WARN", "User suggestions", "missing in user.ui")
+
+    timestamp_issues: list[str] = []
+    for table_name, columns in timestamp_info.items():
+        if not isinstance(columns, dict):
+            continue
+        for column_name, wrong_count in columns.items():
+            if int(wrong_count or 0) > 0:
+                timestamp_issues.append(f"{table_name}.{column_name}={int(wrong_count)}")
+    if timestamp_issues:
+        detail = ", ".join(timestamp_issues)
+        print_check("FAIL", "Timestamp columns in text", detail)
+        issues.append("Open WebUI timestamps have wrong types. Run: python scripts/fix_openwebui_timestamps.py")
+    else:
+        print_check("OK", "Timestamp columns in text", "user integer / config text")
 
     if compose_model_filter_active():
         print_check("WARN", "Compose model filter", "active; can hide models when the pipe fails")

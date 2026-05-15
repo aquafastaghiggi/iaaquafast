@@ -11,6 +11,7 @@ import os
 import math
 import json
 import re
+import threading
 import unicodedata
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -30,8 +31,11 @@ from aquafast_semantics import (
     OFFICIAL_QUESTION_ROUTES,
     list_official_questions,
     normalize_business_question,
+    normalize_product_name,
+    normalize_volume_signature,
     repair_mojibake,
     resolve_official_route,
+    resolve_subgrupo_cigam,
 )
 
 APP_NAME = "Aquafast Scanntech API"
@@ -45,6 +49,8 @@ CHAT_BACKEND = os.getenv("AQUAFAST_CHAT_BACKEND", "duckdb").strip().lower()
 EXPORT_DIR = Path(__file__).with_name("exports") / "generated"
 MYSQL_CONNECT_TIMEOUT_SECONDS = int(os.getenv("AQUAFAST_MYSQL_CONNECT_TIMEOUT_SECONDS", "5"))
 PORTFOLIO_TABLE = "aquafast_portfolio"
+RESOLVED_PRODUCTS_TABLE = "scanntech_produtos_resolvidos"
+QUERY_HISTORY_TABLE = "aquafast_query_history"
 REPORT_SPECS: dict[str, dict[str, Any]] = {
     "ranking_clientes": {
         "title": "Top clientes Aquafast por caixa",
@@ -54,7 +60,7 @@ REPORT_SPECS: dict[str, dict[str, Any]] = {
     "ranking_produtos": {
         "title": "Top produtos Aquafast por caixa",
         "description": "Ranking dos produtos do portifolio Aquafast por caixas vendidas e receita.",
-        "sql": "SELECT * FROM ranking_produtos ORDER BY caixas_vendidas DESC, receita_total DESC, produto",
+        "sql": "SELECT * FROM ranking_produtos ORDER BY total_vendas DESC, receita_total DESC, produto",
     },
     "vendas_por_mes": {
         "title": "Vendas Aquafast por mes",
@@ -71,6 +77,36 @@ REPORT_SPECS: dict[str, dict[str, Any]] = {
         "description": "Participacao de cada fabricante dentro do mercado Aquafast.",
         "sql": "SELECT * FROM ms_mercado_aquafast ORDER BY total_receita DESC LIMIT 20",
     },
+    "concorrentes_por_categoria": {
+        "title": "Concorrentes por categoria",
+        "description": "Concorrentes que lideram cada categoria no universo Scanntech carregado.",
+        "sql": "SELECT * FROM concorrentes_por_categoria ORDER BY categoria, ranking_categoria",
+    },
+    "share_aquafast_por_categoria": {
+        "title": "Share Aquafast por categoria",
+        "description": "Participacao da Aquafast versus concorrentes em cada categoria.",
+        "sql": "SELECT * FROM share_aquafast_por_categoria ORDER BY share_aquafast_pct DESC, faturamento_total_categoria DESC, categoria",
+    },
+    "lojas_com_concorrente_sem_aquafast": {
+        "title": "Lojas com concorrente sem Aquafast",
+        "description": "Lojas que vendem concorrente em categorias onde a Aquafast nao aparece. Usa PDV_ID como chave principal e expõe status_loja quando a ligaÃ§Ã£o nao existir.",
+        "sql": "SELECT * FROM lojas_com_concorrente_sem_aquafast ORDER BY faturamento_concorrente DESC, unidades_scanntech DESC, loja, categoria, concorrente",
+    },
+    "top_concorrentes_por_cidade": {
+        "title": "Top concorrentes por cidade",
+        "description": "Concorrentes mais fortes por cidade e UF.",
+        "sql": "SELECT * FROM top_concorrentes_por_cidade ORDER BY cidade, ranking_cidade",
+    },
+    "historico_consultas": {
+        "title": "Historico de consultas",
+        "description": "Ultimas 20 consultas deterministicamente registradas pelo Scanntech Analyst.",
+        "sql": "SELECT * FROM aquafast_query_history ORDER BY timestamp DESC, id DESC LIMIT 20",
+    },
+    "concorrentes_crescimento_90_dias": {
+        "title": "Concorrentes em crescimento 90 dias",
+        "description": "Concorrentes com maior variacao de faturamento nos 90 dias mais recentes.",
+        "sql": "SELECT * FROM concorrentes_crescimento_90_dias ORDER BY variacao_abs DESC, faturamento_90d DESC, concorrente, categoria",
+    },
     "vendas_por_estado": {
         "title": "Vendas Aquafast por estado",
         "description": "Receita e cobertura por estado dentro do portfolio Aquafast.",
@@ -84,7 +120,61 @@ REPORT_SPECS: dict[str, dict[str, Any]] = {
     "top_produtos_categoria": {
         "title": "Top produtos por categoria Aquafast",
         "description": "Produtos mais fortes por categoria, em caixas, dentro do portfolio Aquafast.",
-        "sql": "SELECT * FROM top_produtos_categoria ORDER BY caixas_vendidas DESC LIMIT 50",
+        "sql": "SELECT * FROM top_produtos_categoria ORDER BY caixas_vendidas DESC, produto_padrao LIMIT 50",
+    },
+    "auditoria_subgrupo_cigam": {
+        "title": "Auditoria SUBGRUPO_CIGAM",
+        "description": "Valida a padronizacao dos produtos Aquafast por SUBGRUPO_CIGAM e mostra nomes originais agrupados.",
+        "sql": """
+            WITH matched AS (
+                SELECT
+                    p.PROD_NAME AS produto_original_scanntech,
+                    ap.SUBGRUPO_CIGAM,
+                    ap.SUBGRUPO_LITRAGEM,
+                    COUNT(*) AS ocorrencias
+                FROM scanntech_produtos_raw p
+                JOIN aquafast_portfolio ap
+                  ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+                 AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(CONCAT(COALESCE(p.PROD_CLASIF_1, ''), ' ', COALESCE(p.PROD_CLASIF_2, '')))), ' ', ''), '.', ''), '/', ''), '-', ''), ',', '')
+                   = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(COALESCE(ap.SUBGRUPO_LITRAGEM, ''))), ' ', ''), '.', ''), '/', ''), '-', ''), ',', '')
+                WHERE UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) = 'AQUAFAST'
+                GROUP BY p.PROD_NAME, ap.SUBGRUPO_CIGAM, ap.SUBGRUPO_LITRAGEM
+            ),
+            unmatched AS (
+                SELECT
+                    p.PROD_NAME AS produto_original_scanntech,
+                    NULL AS SUBGRUPO_CIGAM,
+                    NULL AS SUBGRUPO_LITRAGEM,
+                    COUNT(*) AS ocorrencias
+                FROM scanntech_produtos_raw p
+                LEFT JOIN aquafast_portfolio ap
+                  ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+                 AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(CONCAT(COALESCE(p.PROD_CLASIF_1, ''), ' ', COALESCE(p.PROD_CLASIF_2, '')))), ' ', ''), '.', ''), '/', ''), '-', ''), ',', '')
+                   = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(COALESCE(ap.SUBGRUPO_LITRAGEM, ''))), ' ', ''), '.', ''), '/', ''), '-', ''), ',', '')
+                WHERE UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) = 'AQUAFAST'
+                  AND ap.SUBGRUPO_CIGAM IS NULL
+                GROUP BY p.PROD_NAME
+            )
+            SELECT
+                produto_original_scanntech,
+                SUBGRUPO_CIGAM,
+                SUBGRUPO_LITRAGEM,
+                ocorrencias
+            FROM matched
+            UNION ALL
+            SELECT
+                produto_original_scanntech,
+                SUBGRUPO_CIGAM,
+                SUBGRUPO_LITRAGEM,
+                ocorrencias
+            FROM unmatched
+            ORDER BY SUBGRUPO_CIGAM IS NULL, ocorrencias DESC, produto_original_scanntech
+        """.strip(),
+    },
+    "auditoria_produtos_sem_subgrupo_cigam": {
+        "title": "Auditoria produtos sem SUBGRUPO_CIGAM",
+        "description": "Lista produtos Aquafast sem correspondencia no portfolio e sugere SUBGRUPO_CIGAM apenas quando a similaridade e transparente.",
+        "sql": "SELECT * FROM auditoria_produtos_sem_subgrupo_cigam ORDER BY faturamento DESC, caixas_vendidas DESC, ocorrencias DESC, produto_original_scanntech",
     },
 }
 AVAILABLE_REPORTS = list(REPORT_SPECS)
@@ -95,6 +185,9 @@ QUERY_RESULT_ROW_CAP = 2000
 EXPORT_RESULT_ROW_CAP = 50_000
 
 _SCHEMA_BOOTSTRAPPED = False
+_SCHEMA_BOOTSTRAP_LOCK = threading.Lock()
+_QUERY_HISTORY_LOCK = threading.Lock()
+AUDIT_PRODUCTS_SENTINEL = "auditoria_produtos_sem_subgrupo_cigam"
 
 if not MYSQL_USER or not MYSQL_PASSWORD or not MYSQL_DATABASE:
     raise RuntimeError(
@@ -118,6 +211,486 @@ def normalize(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
     return " ".join(ascii_text.strip().lower().split())
+
+
+def _sql_normalized_key(expr: str) -> str:
+    """
+    Normaliza chaves textuais para join no MySQL/MariaDB sem depender de acento/pontuacao.
+    Mantem a regra simples e local para evitar refatoracao ampla.
+    """
+    return (
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
+        f"UPPER(TRIM(COALESCE({expr}, ''))), ' ', ''), '.', ''), '/', ''), '-', ''), ',', '')"
+    )
+
+
+def _portfolio_join_condition(product_alias: str, portfolio_alias: str) -> str:
+    product_group = _sql_normalized_key(
+        f"CONCAT(COALESCE({product_alias}.PROD_CLASIF_1, ''), ' ', COALESCE({product_alias}.PROD_CLASIF_2, ''))"
+    )
+    portfolio_group = _sql_normalized_key(f"{portfolio_alias}.SUBGRUPO_LITRAGEM")
+    return (
+        f"UPPER(TRIM(COALESCE({product_alias}.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE({portfolio_alias}.PROD_CATEGORY, '')))"
+        f" AND {product_group} = {portfolio_group}"
+    )
+
+
+def _audit_normalize(text: str | None) -> str:
+    if not text:
+        return ""
+    repaired = repair_mojibake(str(text))
+    normalized = normalize(repaired)
+    return normalized.replace("aquafast", " ").replace("produtos", " ").replace("produto", " ")
+
+
+def _audit_token_set(text: str | None) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", _audit_normalize(text))
+    stopwords = {
+        "a",
+        "as",
+        "de",
+        "do",
+        "da",
+        "dos",
+        "das",
+        "e",
+        "em",
+        "com",
+        "para",
+        "por",
+        "um",
+        "uma",
+        "o",
+        "os",
+        "na",
+        "no",
+        "nas",
+        "nos",
+        "liq",
+        "lt",
+    }
+    return {token for token in tokens if len(token) > 1 and token not in stopwords}
+
+
+def _audit_size_signature(text: str | None) -> str:
+    normalized = _audit_normalize(text)
+    normalized = normalized.replace("litros", "l").replace("litro", "l").replace("lts", "l").replace("lt", "l")
+    normalized = normalized.replace(",", ".")
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(ml|l|kg|g)\b", normalized)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    match = re.search(r"\b\d+x(\d+(?:\.\d+)?)\s*(ml|l|kg|g)\b", normalized)
+    if match:
+        return f"{match.group(1)}{match.group(2)}"
+    return ""
+
+
+def _audit_similarity_score(source_text: str, candidate_text: str) -> float:
+    source_tokens = _audit_token_set(source_text)
+    candidate_tokens = _audit_token_set(candidate_text)
+    if not source_tokens or not candidate_tokens:
+        return 0.0
+    union = source_tokens | candidate_tokens
+    if not union:
+        return 0.0
+    score = len(source_tokens & candidate_tokens) / len(union)
+    source_size = _audit_size_signature(source_text)
+    candidate_size = _audit_size_signature(candidate_text)
+    if source_size and candidate_size and source_size == candidate_size:
+        score += 0.30
+    elif source_size and candidate_size and source_size[-1:] == candidate_size[-1:] and source_size[:-1] == candidate_size[:-1]:
+        score += 0.15
+    return min(score, 1.0)
+
+
+def _audit_collect_portfolio_candidates(con: Any) -> list[dict[str, Any]]:
+    columns, rows = _execute_sql(
+        con,
+        """
+        SELECT PROD_CATEGORY, LITRAGEM, SUBGRUPO_LITRAGEM, QTDE_CX, SUBGRUPO_CIGAM
+        FROM aquafast_portfolio
+        WHERE SUBGRUPO_CIGAM IS NOT NULL AND TRIM(SUBGRUPO_CIGAM) <> ''
+        """,
+    )
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _audit_build_result(con: Any) -> dict[str, Any]:
+    columns, rows = _execute_sql(
+        con,
+        f"""
+        SELECT
+          r.PROD_ID AS codigo_produto,
+          r.produto_original_scanntech AS produto_original_scanntech,
+          r.produto_categoria AS produto_categoria,
+          r.produto_clasif_1 AS produto_clasif_1,
+          r.produto_clasif_2 AS produto_clasif_2,
+          COUNT(*) AS ocorrencias,
+          ROUND(SUM(s.QTD), 0) AS unidades_scanntech,
+          ROUND(SUM(s.VALOR_TOTAL), 2) AS faturamento,
+          r.match_mode AS match_mode,
+          r.match_confidence AS match_confidence
+        FROM scanntech s
+        JOIN scanntech_produtos_resolvidos r ON s.COD_PRODUTO = r.PROD_ID
+        WHERE r.sem_correspondencia_portfolio = 1
+        GROUP BY
+          r.PROD_ID,
+          r.produto_original_scanntech,
+          r.produto_categoria,
+          r.produto_clasif_1,
+          r.produto_clasif_2,
+          r.match_mode,
+          r.match_confidence
+        ORDER BY faturamento DESC, unidades_scanntech DESC, ocorrencias DESC, produto_original_scanntech
+        """,
+    )
+
+    portfolio_rows = _audit_collect_portfolio_candidates(con)
+    matched_rows: list[tuple[Any, ...]] = []
+
+    for row in rows:
+        raw = dict(zip(columns, row))
+        raw_category = repair_mojibake(str(raw.get("produto_categoria") or "")).strip()
+        raw_text = " ".join(
+            part
+            for part in [
+                raw.get("produto_original_scanntech") or "",
+                raw.get("produto_categoria") or "",
+                raw.get("produto_clasif_1") or "",
+                raw.get("produto_clasif_2") or "",
+            ]
+            if str(part).strip()
+        )
+        raw_size = _audit_size_signature(raw_text)
+
+        same_category_candidates = [
+            candidate
+            for candidate in portfolio_rows
+            if _audit_normalize(candidate.get("PROD_CATEGORY")) == _audit_normalize(raw_category)
+        ]
+        if raw_size:
+            size_candidates = [
+                candidate
+                for candidate in same_category_candidates
+                if _audit_size_signature(
+                    " ".join(
+                        part
+                        for part in [
+                            candidate.get("PROD_CATEGORY") or "",
+                            candidate.get("SUBGRUPO_LITRAGEM") or "",
+                            candidate.get("SUBGRUPO_CIGAM") or "",
+                            candidate.get("LITRAGEM") or "",
+                        ]
+                        if str(part).strip()
+                    )
+                )
+                == raw_size
+            ]
+            same_category_candidates = size_candidates
+        candidate_pool = same_category_candidates
+
+        best_candidate: dict[str, Any] | None = None
+        best_score = 0.0
+        second_score = 0.0
+
+        for candidate in candidate_pool:
+            candidate_text = " ".join(
+                part
+                for part in [
+                    candidate.get("PROD_CATEGORY") or "",
+                    candidate.get("SUBGRUPO_LITRAGEM") or "",
+                    candidate.get("SUBGRUPO_CIGAM") or "",
+                    candidate.get("LITRAGEM") or "",
+                ]
+                if str(part).strip()
+            )
+            score = _audit_similarity_score(raw_text, candidate_text)
+            if score > best_score:
+                second_score = best_score
+                best_score = score
+                best_candidate = candidate
+            elif score > second_score:
+                second_score = score
+
+        suggested_subgrupo = ""
+        suggested_boxes = None
+        status = "sem_match"
+
+        if best_candidate is not None and best_score >= 0.30:
+            suggested_subgrupo = str(best_candidate.get("SUBGRUPO_CIGAM") or "").strip()
+            suggested_qtde = best_candidate.get("QTDE_CX")
+            unidades = raw.get("unidades_scanntech")
+            if suggested_qtde not in (None, 0) and unidades is not None:
+                try:
+                    suggested_boxes = _round_half_up(float(unidades) / float(suggested_qtde))
+                except Exception:
+                    suggested_boxes = None
+            if best_score >= 0.58 and (best_score - second_score) >= 0.08:
+                status = "revisar_manual"
+            else:
+                status = "sugestao_baixa_confianca"
+        else:
+            status = "sem_match"
+
+        matched_rows.append(
+            (
+                raw.get("codigo_produto"),
+                repair_mojibake(str(raw.get("produto_original_scanntech") or "")),
+                int(raw.get("ocorrencias") or 0),
+                int(suggested_boxes) if suggested_boxes is not None else None,
+                int(raw.get("unidades_scanntech") or 0),
+                float(raw.get("faturamento") or 0),
+                suggested_subgrupo,
+                status,
+            )
+        )
+
+    matched_columns = [
+        "codigo_produto",
+        "produto_original_scanntech",
+        "ocorrencias",
+        "caixas_vendidas",
+        "unidades_scanntech",
+        "faturamento",
+        "sugestao_subgrupo_cigam",
+        "status",
+    ]
+    return {
+        "columns": matched_columns,
+        "rows": matched_rows,
+        "row_count": len(matched_rows),
+        "markdown": format_markdown(matched_columns, matched_rows),
+        "truncated": False,
+        "row_cap": None,
+    }
+
+
+def _build_lojas_com_concorrente_sem_aquafast_result() -> dict[str, Any]:
+    con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+    try:
+        columns, rows = _execute_sql(
+            con,
+            """
+            WITH vendas AS (
+              SELECT
+                v.PDV_ID,
+                COALESCE(NULLIF(d.PDV_NAME, ''), NULLIF(d.PDV_SOCIAL_NAME, ''), CONCAT('PDV ', CAST(v.PDV_ID AS VARCHAR))) AS loja,
+                COALESCE(NULLIF(d.PDV_LOCATION, ''), 'SEM CIDADE') AS cidade,
+                COALESCE(NULLIF(d.PDV_STATE, ''), 'SEM UF') AS uf,
+                CASE WHEN d.PDV_ID IS NULL THEN 'sem_chave_pdv' ELSE 'ok' END AS status_loja,
+                p.PROD_CATEGORY AS categoria,
+                COALESCE(NULLIF(p.PROD_MANUFACTURER, ''), NULLIF(p.PROD_BRAND, ''), 'SEM FABRICANTE') AS concorrente,
+                TRY_CAST(v.SALES_UNITS AS DOUBLE) AS unidades,
+                TRY_CAST(v.GROSS_SELLOUT AS DOUBLE) AS receita,
+                v.MONTH_ID,
+                p.PROD_ID
+              FROM scanntech_vendas_raw v
+              JOIN scanntech_produtos_raw p
+                ON v.PROD_ID = p.PROD_ID
+              LEFT JOIN scanntech_clientes_raw d
+                ON v.PDV_ID = d.PDV_ID
+              WHERE p.PROD_CATEGORY IS NOT NULL
+                AND UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) <> 'AQUAFAST'
+            ),
+            aqua_presence AS (
+              SELECT DISTINCT
+                v.PDV_ID,
+                p.PROD_CATEGORY AS categoria
+              FROM scanntech_vendas_raw v
+              JOIN scanntech_produtos_raw p
+                ON v.PROD_ID = p.PROD_ID
+              WHERE p.PROD_CATEGORY IS NOT NULL
+                AND UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) = 'AQUAFAST'
+                AND v.PDV_ID IS NOT NULL
+            )
+            SELECT
+              loja,
+              cidade,
+              uf,
+              status_loja,
+              concorrente,
+              v.categoria AS categoria,
+              ROUND(SUM(receita), 2) AS faturamento_concorrente,
+              ROUND(SUM(unidades), 0) AS unidades_scanntech,
+              MAX(MONTH_ID) AS ultima_venda_concorrente
+            FROM vendas v
+            LEFT JOIN aqua_presence a
+              ON a.PDV_ID = v.PDV_ID
+             AND a.categoria = v.categoria
+            WHERE a.PDV_ID IS NULL
+            GROUP BY loja, cidade, uf, status_loja, concorrente, v.categoria
+            ORDER BY faturamento_concorrente DESC, unidades_scanntech DESC, loja, categoria, concorrente
+            """.strip(),
+        )
+    finally:
+        con.close()
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "markdown": format_markdown(columns, rows),
+        "truncated": False,
+        "row_cap": None,
+    }
+
+
+def _build_historico_consultas_result() -> dict[str, Any]:
+    con = open_connection()
+    try:
+        columns, rows = _execute_sql(
+            con,
+            """
+            SELECT
+              timestamp AS data_hora,
+              pergunta,
+              report_name AS relatorio,
+              metric,
+              rows_returned AS linhas_retornadas,
+              status
+            FROM aquafast_query_history
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 20
+            """.strip(),
+        )
+    finally:
+        con.close()
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "markdown": format_markdown(columns, rows),
+        "truncated": False,
+        "row_cap": None,
+    }
+
+
+def _is_audit_products_without_subgroup_query(sql: str) -> bool:
+    return AUDIT_PRODUCTS_SENTINEL in sql.lower()
+
+
+def _is_lojas_com_concorrente_sem_aquafast_query(sql: str) -> bool:
+    return "lojas_com_concorrente_sem_aquafast" in sql.lower()
+
+
+def _normalize_sql_for_match(sql: str) -> str:
+    return " ".join(sql.strip().rstrip(";").lower().split())
+
+
+def _infer_report_name_from_sql(sql: str) -> str | None:
+    normalized = _normalize_sql_for_match(sql)
+    if normalized == _normalize_sql_for_match(
+        "SELECT * FROM lojas_com_concorrente_sem_aquafast ORDER BY faturamento_concorrente DESC, unidades_scanntech DESC, loja, categoria, concorrente"
+    ):
+        return "lojas_com_concorrente_sem_aquafast"
+    if normalized == _normalize_sql_for_match(
+        "SELECT * FROM aquafast_query_history ORDER BY timestamp DESC, id DESC LIMIT 20"
+    ):
+        return "historico_consultas"
+    if _is_audit_products_without_subgroup_query(sql):
+        return "auditoria_produtos_sem_subgrupo_cigam"
+    for report_name, spec in REPORT_SPECS.items():
+        if report_name in {"lojas_com_concorrente_sem_aquafast", "historico_consultas", "auditoria_produtos_sem_subgrupo_cigam"}:
+            continue
+        if normalized == _normalize_sql_for_match(str(spec["sql"])):
+            return report_name
+    return None
+
+
+def _route_metadata_for_response(question: str, title: str, sql: str) -> dict[str, str]:
+    official_route = resolve_official_route(question) or resolve_official_route(title) or resolve_official_route(sql)
+    report_name = _infer_report_name_from_sql(sql) or ""
+    route = official_route.id if official_route is not None else report_name
+    group = repair_mojibake(official_route.title) if official_route is not None else title.strip()
+    if not group:
+        group = title.strip() or "Consulta SQL"
+    intent = route or report_name or ""
+    return {
+        "route": route,
+        "group": group,
+        "intent": intent,
+        "report_name": report_name or route or "",
+    }
+
+
+def _history_metric_for_report(report_name: str) -> str:
+    return {
+        "ranking_clientes": "caixas_vendidas",
+        "ranking_produtos": "caixas_vendidas",
+        "vendas_por_mes": "receita_total",
+        "vendas_por_cidade": "receita_total",
+        "market_share_fabricante": "market_share_pct",
+        "concorrentes_por_categoria": "faturamento",
+        "share_aquafast_por_categoria": "share_aquafast_pct",
+        "lojas_com_concorrente_sem_aquafast": "faturamento_concorrente",
+        "top_concorrentes_por_cidade": "faturamento",
+        "concorrentes_crescimento_90_dias": "variacao_abs",
+        "vendas_por_estado": "receita_total",
+        "ranking_redes": "total_receita",
+        "top_produtos_categoria": "caixas_vendidas",
+        "auditoria_subgrupo_cigam": "ocorrencias",
+        "auditoria_produtos_sem_subgrupo_cigam": "faturamento",
+        "historico_consultas": "rows_returned",
+    }.get(report_name, "rows_returned")
+
+
+def _persist_query_history(
+    pergunta: str,
+    report_name: str,
+    metric: str,
+    rows_returned: int,
+    status: str,
+    timestamp_value: datetime | None = None,
+) -> dict[str, Any]:
+    timestamp = (timestamp_value or datetime.now()).replace(microsecond=0)
+    metadata = {
+        "history_timestamp": timestamp.isoformat(sep=" "),
+        "history_report_name": report_name,
+        "history_metric": metric,
+        "history_rows_returned": int(rows_returned),
+        "history_status": status,
+    }
+    if report_name == "historico_consultas":
+        return metadata
+
+    try:
+        with _QUERY_HISTORY_LOCK:
+            con = duckdb.connect(str(DUCKDB_PATH))
+            try:
+                _ensure_query_history_table(con)
+                next_id = con.execute(f"SELECT COALESCE(MAX(id), 0) + 1 FROM {QUERY_HISTORY_TABLE}").fetchone()[0]
+                con.execute(
+                    f"INSERT INTO {QUERY_HISTORY_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        int(next_id or 1),
+                        timestamp,
+                        pergunta,
+                        report_name,
+                        metric,
+                        int(rows_returned),
+                        status,
+                    ],
+                )
+                con.commit()
+            finally:
+                con.close()
+    except Exception as exc:
+        print(f"WARN: query history write skipped: {exc}")
+    return metadata
+
+
+def _attach_history_metadata(
+    result: dict[str, Any],
+    *,
+    pergunta: str,
+    report_name: str,
+    rows_returned: int,
+    status: str = "ok",
+) -> dict[str, Any]:
+    metric = _history_metric_for_report(report_name)
+    history = _persist_query_history(pergunta, report_name, metric, rows_returned, status)
+    return {**result, **history}
 
 
 def sanitize_filename(text: str) -> str:
@@ -215,6 +788,25 @@ def _build_source_note(question: str, title: str, sql: str) -> str:
             "Fonte: `top_produtos_categoria`. "
             "A consulta usa a presença em PDVs e o volume em caixas como proxy de potencial de venda."
         )
+    if any(
+        term in text
+        for term in [
+            "concorrentes por categoria",
+            "share aquafast por categoria",
+            "lojas com concorrente sem aquafast",
+            "top concorrentes por cidade",
+            "concorrentes em crescimento 90 dias",
+            "concorrentes_por_categoria",
+            "share_aquafast_por_categoria",
+            "lojas_com_concorrente_sem_aquafast",
+            "top_concorrentes_por_cidade",
+            "concorrentes_crescimento_90_dias",
+        ]
+    ):
+        return (
+            "Fonte: views deterministicas de concorrencia. "
+            "A consulta usa o mercado carregado e separa Aquafast de concorrentes sem chamar LLM."
+        )
     if any(term in text for term in ["maior concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
         return (
             "Fonte: `ms_mercado_aquafast`. "
@@ -245,6 +837,11 @@ def _build_source_note(question: str, title: str, sql: str) -> str:
             "Fonte: `vendas_caixas_estado`. "
             "A consulta cruza as vendas Aquafast com a UF para mostrar distribuicao geografica."
         )
+    if any(term in text for term in ["historico de consultas", "historico consultas", "ultimas consultas", "quais relatorios eu consultei"]):
+        return (
+            "Fonte: `aquafast_query_history`. "
+            "A consulta mostra as 20 consultas deterministicas mais recentes registradas pelo Scanntech Analyst."
+        )
     if any(term in text for term in ["top produtos", "ranking produtos", "mais vendidos", "receita por produto", "volume de vendas"]):
         return (
             "Fonte: `ranking_produtos`. "
@@ -267,6 +864,25 @@ def _build_source_note_clean(question: str, title: str, sql: str) -> str:
         return repair_mojibake(
             "Fonte: `top_produtos_categoria`. "
             "A consulta usa a presenca em PDVs e o volume em caixas como proxy de potencial de venda."
+        )
+    if any(
+        term in text
+        for term in [
+            "concorrentes por categoria",
+            "share aquafast por categoria",
+            "lojas com concorrente sem aquafast",
+            "top concorrentes por cidade",
+            "concorrentes em crescimento 90 dias",
+            "concorrentes_por_categoria",
+            "share_aquafast_por_categoria",
+            "lojas_com_concorrente_sem_aquafast",
+            "top_concorrentes_por_cidade",
+            "concorrentes_crescimento_90_dias",
+        ]
+    ):
+        return repair_mojibake(
+            "Fonte: views deterministicas de concorrencia. "
+            "A consulta usa o mercado carregado e separa Aquafast de concorrentes sem chamar LLM."
         )
     if any(term in text for term in ["maior concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
         return repair_mojibake(
@@ -297,6 +913,11 @@ def _build_source_note_clean(question: str, title: str, sql: str) -> str:
         return repair_mojibake(
             "Fonte: `vendas_caixas_estado`. "
             "A consulta cruza as vendas Aquafast com a UF para mostrar distribuicao geografica."
+        )
+    if any(term in text for term in ["historico de consultas", "historico consultas", "ultimas consultas", "quais relatorios eu consultei"]):
+        return repair_mojibake(
+            "Fonte: `aquafast_query_history`. "
+            "A consulta mostra as 20 consultas deterministicas mais recentes registradas pelo Scanntech Analyst."
         )
     if any(term in text for term in ["top produtos", "ranking produtos", "mais vendidos", "receita por produto", "volume de vendas"]):
         return repair_mojibake(
@@ -348,6 +969,131 @@ def _fetch_mysql_portfolio_rows() -> list[tuple[Any, ...]]:
         con.close()
 
 
+def _fetch_resolution_source_rows(con: Any) -> tuple[list[str], list[tuple[Any, ...]], list[str], list[tuple[Any, ...]]]:
+    product_columns, product_rows = _execute_sql(
+        con,
+        """
+        SELECT
+          PROD_ID,
+          PROD_NAME,
+          PROD_CATEGORY,
+          PROD_CLASIF_1,
+          PROD_CLASIF_2,
+          PROD_MANUFACTURER,
+          PROD_BRAND,
+          PROD_NET_WEIGHT
+        FROM scanntech_produtos_raw
+        WHERE UPPER(TRIM(COALESCE(PROD_MANUFACTURER, ''))) = 'AQUAFAST'
+        """.strip(),
+    )
+    portfolio_columns, portfolio_rows = _execute_sql(
+        con,
+        """
+        SELECT
+          PROD_CATEGORY,
+          LITRAGEM,
+          SUBGRUPO_LITRAGEM,
+          QTDE_CX,
+          SUBGRUPO_CIGAM
+        FROM aquafast_portfolio
+        WHERE SUBGRUPO_CIGAM IS NOT NULL AND TRIM(SUBGRUPO_CIGAM) <> ''
+        """.strip(),
+    )
+    return product_columns, product_rows, portfolio_columns, portfolio_rows
+
+
+def _build_product_resolution_rows(con: Any) -> tuple[list[str], list[tuple[Any, ...]]]:
+    product_columns, product_rows, portfolio_columns, portfolio_rows = _fetch_resolution_source_rows(con)
+    portfolio = [dict(zip(portfolio_columns, row)) for row in portfolio_rows]
+
+    resolved_columns = [
+        "PROD_ID",
+        "produto_original_scanntech",
+        "produto_categoria",
+        "produto_clasif_1",
+        "produto_clasif_2",
+        "produto_padrao",
+        "subgrupo_cigam",
+        "subgrupo_litragem",
+        "qtde_cx",
+        "match_mode",
+        "match_confidence",
+        "sem_correspondencia_portfolio",
+    ]
+    resolved_rows: list[tuple[Any, ...]] = []
+    for row in product_rows:
+        raw = dict(zip(product_columns, row))
+        resolved = resolve_subgrupo_cigam(
+            raw.get("PROD_NAME"),
+            raw.get("PROD_CATEGORY"),
+            raw.get("PROD_CLASIF_1"),
+            raw.get("PROD_CLASIF_2"),
+            portfolio,
+        )
+        resolved_rows.append(
+            (
+                raw.get("PROD_ID"),
+                repair_mojibake(str(raw.get("PROD_NAME") or "")),
+                repair_mojibake(str(raw.get("PROD_CATEGORY") or "")),
+                repair_mojibake(str(raw.get("PROD_CLASIF_1") or "")),
+                repair_mojibake(str(raw.get("PROD_CLASIF_2") or "")),
+                repair_mojibake(str(resolved.get("produto_padrao") or raw.get("PROD_NAME") or "")),
+                repair_mojibake(str(resolved.get("subgrupo_cigam") or "")),
+                repair_mojibake(str(resolved.get("subgrupo_litragem") or "")),
+                int(resolved["qtde_cx"]) if resolved.get("qtde_cx") not in (None, "") else None,
+                str(resolved.get("match_mode") or ""),
+                str(resolved.get("match_confidence") or ""),
+                0 if resolved.get("subgrupo_cigam") else 1,
+            )
+        )
+    return resolved_columns, resolved_rows
+
+
+def _create_product_resolution_table(con: Any) -> None:
+    columns, rows = _build_product_resolution_rows(con)
+    con.execute(f"DROP TABLE IF EXISTS {RESOLVED_PRODUCTS_TABLE}")
+    con.execute(
+        f"""
+        CREATE TABLE {RESOLVED_PRODUCTS_TABLE} (
+            PROD_ID VARCHAR,
+            produto_original_scanntech VARCHAR,
+            produto_categoria VARCHAR,
+            produto_clasif_1 VARCHAR,
+            produto_clasif_2 VARCHAR,
+            produto_padrao VARCHAR,
+            subgrupo_cigam VARCHAR,
+            subgrupo_litragem VARCHAR,
+            qtde_cx INTEGER,
+            match_mode VARCHAR,
+            match_confidence VARCHAR,
+            sem_correspondencia_portfolio INTEGER
+        )
+        """
+    )
+    if rows:
+        placeholders = ", ".join(["?"] * len(columns))
+        con.executemany(
+            f"INSERT INTO {RESOLVED_PRODUCTS_TABLE} VALUES ({placeholders})",
+            rows,
+        )
+
+
+def _ensure_query_history_table(con: Any) -> None:
+    con.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {QUERY_HISTORY_TABLE} (
+            id BIGINT,
+            timestamp TIMESTAMP,
+            pergunta VARCHAR,
+            report_name VARCHAR,
+            metric VARCHAR,
+            rows_returned BIGINT,
+            status VARCHAR
+        )
+        """
+    )
+
+
 def _bootstrap_duckdb_aquafast_views() -> None:
     global _SCHEMA_BOOTSTRAPPED
     if _SCHEMA_BOOTSTRAPPED:
@@ -383,6 +1129,8 @@ def _bootstrap_duckdb_aquafast_views() -> None:
                     f"INSERT INTO {PORTFOLIO_TABLE} VALUES (?, ?, ?, ?, ?)",
                     normalized,
                 )
+        _create_product_resolution_table(con)
+        _ensure_query_history_table(con)
 
         statements = [
             f"""
@@ -397,14 +1145,23 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               p.PROD_MANUFACTURER AS fabricante,
               p.PROD_BRAND AS marca,
               p.PROD_CATEGORY AS categoria,
+              p.PROD_CLASIF_1 AS subgrupo_litragem_base,
               p.PROD_NET_WEIGHT AS peso_volume,
               p.PROD_CLASIF_2 AS litragem,
+              r.produto_padrao AS produto_padrao,
+              NULLIF(r.subgrupo_cigam, '') AS subgrupo_cigam,
+              NULLIF(r.subgrupo_litragem, '') AS subgrupo_litragem,
+              r.qtde_cx AS unidades_por_caixa,
+              r.match_mode AS resolucao_modo,
+              r.match_confidence AS resolucao_confianca,
+              r.sem_correspondencia_portfolio AS sem_correspondencia_portfolio,
               p.EST_MER_3_DESCRIPTION AS nivel3,
               p.EST_MER_4_DESCRIPTION AS nivel4,
               c.PDV_ID,
-              c.PDV_NAME AS loja,
-              c.PDV_LOCATION AS cidade,
-              c.PDV_STATE AS estado,
+              COALESCE(NULLIF(c.PDV_NAME, ''), NULLIF(c.PDV_SOCIAL_NAME, ''), NULLIF(s.RAZAO_SOCIAL, ''), 'SEM LOJA') AS loja,
+              COALESCE(NULLIF(c.PDV_LOCATION, ''), 'SEM CIDADE') AS cidade,
+              COALESCE(NULLIF(c.PDV_STATE, ''), 'SEM UF') AS estado,
+              CASE WHEN c.PDV_ID IS NULL THEN 'sem_chave_pdv' ELSE 'ok' END AS status_loja,
               c.PDV_MICROREGION AS microrregiao,
               c.PDV_STORE_CHAIN AS rede,
               c.STORE_CLASSIFICATION AS tipo_loja,
@@ -414,8 +1171,9 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               CASE WHEN LOWER(COALESCE(p.PROD_MANUFACTURER, '')) = 'aquafast' THEN 1 ELSE 0 END AS is_aquafast
             FROM scanntech s
             LEFT JOIN scanntech_produtos_raw p ON s.COD_PRODUTO = p.PROD_ID
+            LEFT JOIN scanntech_produtos_resolvidos r ON p.PROD_ID = r.PROD_ID
             LEFT JOIN scanntech_clientes_raw c
-              ON LOWER(TRIM(s.RAZAO_SOCIAL)) = LOWER(TRIM(COALESCE(c.PDV_SOCIAL_NAME, c.PDV_NAME)))
+              ON TRY_CAST(s.CNPJ AS BIGINT) = c.PDV_ID
             WHERE p.PROD_CATEGORY IN (SELECT DISTINCT PROD_CATEGORY FROM aquafast_portfolio)
             """,
             f"""
@@ -425,6 +1183,7 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               m.fabricante,
               m.marca,
               m.categoria,
+              m.subgrupo_litragem_base,
               m.litragem,
               m.produto,
               m.estado,
@@ -439,19 +1198,20 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               ROUND(SUM(m.unidades), 0) AS unidades,
               ROUND(SUM(m.receita), 2) AS total_receita,
               ROUND(SUM(m.receita), 2) AS receita,
-              ap.QTDE_CX AS unidades_por_caixa,
-              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0) AS total_caixas,
-              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0) AS caixas,
+              m.unidades_por_caixa,
+              ROUND(SUM(m.unidades) / NULLIF(m.unidades_por_caixa, 0), 0) AS total_caixas,
+              ROUND(SUM(m.unidades) / NULLIF(m.unidades_por_caixa, 0), 0) AS caixas,
+              m.subgrupo_litragem AS subgrupo_litragem,
+              NULLIF(m.subgrupo_cigam, '') AS subgrupo_cigam,
+              COALESCE(NULLIF(m.subgrupo_cigam, ''), m.produto_padrao, m.produto) AS produto_padrao,
+              m.sem_correspondencia_portfolio AS sem_correspondencia_portfolio,
               ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades), 0), 2) AS preco_medio_unitario,
-              ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0), 2) AS preco_medio_caixa
+              ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades) / NULLIF(m.unidades_por_caixa, 0), 0), 2) AS preco_medio_caixa
             FROM mercado_aquafast m
-            LEFT JOIN aquafast_portfolio ap
-              ON UPPER(TRIM(COALESCE(m.categoria, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
-             AND UPPER(TRIM(COALESCE(m.litragem, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             GROUP BY
-              m.MONTH_ID, m.fabricante, m.marca, m.categoria, m.litragem, m.produto,
+              m.MONTH_ID, m.fabricante, m.marca, m.categoria, m.subgrupo_litragem_base, m.litragem, m.produto,
               m.estado, m.microrregiao, m.rede, m.tipo_loja, m.loja, m.PDV_ID,
-              m.is_aquafast, ap.QTDE_CX
+              m.is_aquafast, m.unidades_por_caixa, m.subgrupo_litragem, m.subgrupo_cigam, m.produto_padrao, m.sem_correspondencia_portfolio
             """,
             """
             CREATE OR REPLACE VIEW ranking_clientes AS
@@ -470,19 +1230,24 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             """
             CREATE OR REPLACE VIEW ranking_produtos AS
             SELECT
-              produto,
+              produto_padrao,
+              MIN(produto) AS produto_original_exemplo,
+              subgrupo_cigam,
+              subgrupo_litragem,
               categoria,
               litragem,
               fabricante,
               marca,
+              COUNT(DISTINCT produto) AS variacoes_produto_original,
               ROUND(SUM(unidades), 0) AS unidades_scanntech,
               ROUND(SUM(unidades), 0) AS total_unidades,
-              ROUND(SUM(caixas), 0) AS caixas_vendidas,
+              ROUND(SUM(unidades), 0) AS total_vendas,
+              ROUND(SUM(unidades) / NULLIF(MAX(unidades_por_caixa), 0), 0) AS caixas_vendidas,
               ROUND(SUM(receita), 2) AS receita_total,
-              ROUND(SUM(receita) / NULLIF(SUM(caixas), 0), 2) AS preco_medio_caixa
+              ROUND(SUM(receita) / NULLIF(SUM(unidades) / NULLIF(MAX(unidades_por_caixa), 0), 0), 2) AS preco_medio_caixa
             FROM vendas_em_caixas
             WHERE is_aquafast = 1
-            GROUP BY produto, categoria, litragem, fabricante, marca
+            GROUP BY produto_padrao, subgrupo_cigam, subgrupo_litragem, categoria, litragem, fabricante, marca
             """,
             """
             CREATE OR REPLACE VIEW vendas_por_mes AS
@@ -511,6 +1276,152 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             WHERE fabricante IS NOT NULL
             GROUP BY fabricante
             ORDER BY total_receita DESC
+            """,
+            """
+            CREATE OR REPLACE VIEW concorrentes_por_categoria AS
+            WITH totais AS (
+              SELECT
+                categoria,
+                ROUND(SUM(receita), 2) AS faturamento_total_categoria
+              FROM mercado_aquafast
+              WHERE categoria IS NOT NULL
+              GROUP BY categoria
+            ),
+            base AS (
+              SELECT
+                categoria,
+                COALESCE(NULLIF(fabricante, ''), NULLIF(marca, ''), 'SEM FABRICANTE') AS concorrente,
+                ROUND(SUM(receita), 2) AS faturamento,
+                ROUND(SUM(unidades), 0) AS unidades_scanntech,
+                ROUND(SUM(caixas), 0) AS caixas_vendidas
+              FROM mercado_aquafast
+              WHERE categoria IS NOT NULL
+                AND is_aquafast = 0
+              GROUP BY categoria, COALESCE(NULLIF(fabricante, ''), NULLIF(marca, ''), 'SEM FABRICANTE')
+            )
+            SELECT
+              base.categoria,
+              base.concorrente,
+              base.faturamento,
+              base.unidades_scanntech,
+              base.caixas_vendidas,
+              ROUND(base.faturamento / NULLIF(totais.faturamento_total_categoria, 0) * 100, 2) AS participacao_categoria_pct,
+              ROW_NUMBER() OVER (
+                PARTITION BY base.categoria
+                ORDER BY base.faturamento DESC, base.unidades_scanntech DESC, base.concorrente
+              ) AS ranking_categoria
+            FROM base
+            JOIN totais ON totais.categoria = base.categoria
+            ORDER BY base.categoria, ranking_categoria, base.concorrente
+            """,
+            """
+            CREATE OR REPLACE VIEW share_aquafast_por_categoria AS
+            WITH base AS (
+              SELECT
+                categoria,
+                ROUND(SUM(CASE WHEN is_aquafast = 1 THEN receita ELSE 0 END), 2) AS faturamento_aquafast,
+                ROUND(SUM(CASE WHEN is_aquafast = 0 THEN receita ELSE 0 END), 2) AS faturamento_concorrentes,
+                ROUND(SUM(receita), 2) AS faturamento_total_categoria,
+                ROUND(SUM(CASE WHEN is_aquafast = 1 THEN unidades ELSE 0 END), 0) AS unidades_aquafast,
+                ROUND(SUM(CASE WHEN is_aquafast = 0 THEN unidades ELSE 0 END), 0) AS unidades_concorrentes
+              FROM mercado_aquafast
+              WHERE categoria IS NOT NULL
+              GROUP BY categoria
+            )
+            SELECT
+              categoria,
+              faturamento_total_categoria,
+              faturamento_aquafast,
+              faturamento_concorrentes,
+              ROUND(faturamento_aquafast / NULLIF(faturamento_total_categoria, 0) * 100, 2) AS share_aquafast_pct,
+              unidades_aquafast,
+              unidades_concorrentes
+            FROM base
+            ORDER BY share_aquafast_pct DESC, faturamento_total_categoria DESC, categoria
+            """,
+            """
+            CREATE OR REPLACE VIEW top_concorrentes_por_cidade AS
+            WITH base AS (
+              SELECT
+                COALESCE(NULLIF(cidade, ''), 'SEM CIDADE') AS cidade,
+                COALESCE(NULLIF(estado, ''), 'SEM UF') AS uf,
+                COALESCE(NULLIF(fabricante, ''), NULLIF(marca, ''), 'SEM FABRICANTE') AS concorrente,
+                ROUND(SUM(receita), 2) AS faturamento,
+                ROUND(SUM(unidades), 0) AS unidades_scanntech
+              FROM mercado_aquafast
+              WHERE is_aquafast = 0
+                AND cidade IS NOT NULL
+              GROUP BY
+                COALESCE(NULLIF(cidade, ''), 'SEM CIDADE'),
+                COALESCE(NULLIF(estado, ''), 'SEM UF'),
+                COALESCE(NULLIF(fabricante, ''), NULLIF(marca, ''), 'SEM FABRICANTE')
+            ),
+            ranked AS (
+              SELECT
+                cidade,
+                uf,
+                concorrente,
+                faturamento,
+                unidades_scanntech,
+                ROW_NUMBER() OVER (
+                  PARTITION BY cidade, uf
+                  ORDER BY faturamento DESC, unidades_scanntech DESC, concorrente
+                ) AS ranking_cidade
+              FROM base
+            )
+            SELECT
+              cidade,
+              uf,
+              concorrente,
+              faturamento,
+              unidades_scanntech,
+              ranking_cidade
+            FROM ranked
+            ORDER BY cidade, ranking_cidade, concorrente
+            """,
+            """
+            CREATE OR REPLACE VIEW concorrentes_crescimento_90_dias AS
+            WITH meses AS (
+              SELECT DISTINCT MONTH_ID
+              FROM mercado_aquafast
+              WHERE MONTH_ID IS NOT NULL
+              ORDER BY MONTH_ID DESC
+              LIMIT 6
+            ),
+            base AS (
+              SELECT
+                COALESCE(NULLIF(m.fabricante, ''), NULLIF(m.marca, ''), 'SEM FABRICANTE') AS concorrente,
+                m.categoria,
+                m.unidades,
+                m.receita,
+                DENSE_RANK() OVER (ORDER BY m.MONTH_ID DESC) AS month_rank
+              FROM mercado_aquafast m
+              JOIN meses x ON x.MONTH_ID = m.MONTH_ID
+              WHERE m.is_aquafast = 0
+                AND m.categoria IS NOT NULL
+            ),
+            agg AS (
+              SELECT
+                concorrente,
+                categoria,
+                ROUND(SUM(CASE WHEN month_rank <= 3 THEN receita ELSE 0 END), 2) AS faturamento_90d,
+                ROUND(SUM(CASE WHEN month_rank BETWEEN 4 AND 6 THEN receita ELSE 0 END), 2) AS faturamento_90d_anterior,
+                ROUND(SUM(CASE WHEN month_rank <= 3 THEN unidades ELSE 0 END), 0) AS unidades_90d,
+                ROUND(SUM(CASE WHEN month_rank BETWEEN 4 AND 6 THEN unidades ELSE 0 END), 0) AS unidades_90d_anterior
+              FROM base
+              GROUP BY concorrente, categoria
+            )
+            SELECT
+              concorrente,
+              categoria,
+              faturamento_90d,
+              faturamento_90d_anterior,
+              ROUND(faturamento_90d - faturamento_90d_anterior, 2) AS variacao_abs,
+              ROUND((faturamento_90d - faturamento_90d_anterior) / NULLIF(faturamento_90d_anterior, 0) * 100, 2) AS variacao_pct,
+              unidades_90d,
+              unidades_90d_anterior
+            FROM agg
+            ORDER BY variacao_abs DESC, faturamento_90d DESC, concorrente, categoria
             """,
             """
             CREATE OR REPLACE VIEW concorrencia_por_categoria AS
@@ -566,12 +1477,9 @@ def _bootstrap_duckdb_aquafast_views() -> None:
               COALESCE(m.estado, 'SEM UF') AS estado,
               COUNT(DISTINCT m.PDV_ID) AS pdvs,
               ROUND(SUM(m.unidades), 0) AS unidades_scanntech,
-              ROUND(SUM(m.unidades / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+              ROUND(SUM(m.unidades / NULLIF(m.unidades_por_caixa, 0)), 0) AS caixas_vendidas,
               ROUND(SUM(m.receita), 2) AS receita_total
             FROM mercado_aquafast m
-            LEFT JOIN aquafast_portfolio ap
-              ON UPPER(TRIM(COALESCE(m.categoria, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
-             AND UPPER(TRIM(COALESCE(m.litragem, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             WHERE m.is_aquafast = 1
             GROUP BY COALESCE(m.cidade, 'SEM CIDADE'), COALESCE(m.estado, 'SEM UF')
             ORDER BY receita_total DESC, caixas_vendidas DESC, cidade
@@ -595,23 +1503,23 @@ def _bootstrap_duckdb_aquafast_views() -> None:
             CREATE OR REPLACE VIEW top_produtos_categoria AS
             SELECT
               m.categoria,
-              m.produto,
+              COALESCE(NULLIF(m.subgrupo_cigam, ''), m.produto_padrao, m.produto) AS produto_padrao,
+              MIN(m.produto) AS produto_original_exemplo,
+              NULLIF(m.subgrupo_cigam, '') AS subgrupo_cigam,
+              m.subgrupo_litragem AS subgrupo_litragem,
               m.fabricante,
               m.marca,
-              ROUND(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0) AS caixas_vendidas,
+              COUNT(DISTINCT m.produto) AS variacoes_produto_original,
+              ROUND(SUM(m.unidades) / NULLIF(MAX(m.unidades_por_caixa), 0), 0) AS caixas_vendidas,
               ROUND(SUM(m.unidades), 0) AS unidades_scanntech,
               ROUND(SUM(m.unidades), 0) AS total_unidades,
               ROUND(SUM(m.receita), 2) AS total_receita,
-              ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades) / NULLIF(ap.QTDE_CX, 0), 0), 2) AS preco_medio_caixa,
+              ROUND(SUM(m.receita) / NULLIF(SUM(m.unidades) / NULLIF(MAX(m.unidades_por_caixa), 0), 0), 2) AS preco_medio_caixa,
               COUNT(DISTINCT m.PDV_ID) AS pdvs_com_venda
             FROM mercado_aquafast m
-            LEFT JOIN aquafast_portfolio ap
-              ON UPPER(TRIM(COALESCE(m.categoria, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
-             AND UPPER(TRIM(COALESCE(m.litragem, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
             WHERE m.is_aquafast = 1
-              AND ap.QTDE_CX IS NOT NULL
-            GROUP BY m.categoria, m.produto, m.fabricante, m.marca, ap.QTDE_CX
-            ORDER BY caixas_vendidas DESC
+            GROUP BY m.categoria, COALESCE(NULLIF(m.subgrupo_cigam, ''), m.produto_padrao, m.produto), NULLIF(m.subgrupo_cigam, ''), m.subgrupo_litragem, m.fabricante, m.marca
+            ORDER BY caixas_vendidas DESC, total_receita DESC, produto_padrao
             """,
             """
             CREATE OR REPLACE VIEW ranking_redes AS
@@ -827,6 +1735,183 @@ def _bootstrap_compatibility_views() -> None:
             ORDER BY total_receita DESC
             """,
             """
+            DROP VIEW IF EXISTS concorrentes_por_categoria
+            """,
+            """
+            DROP TABLE IF EXISTS concorrentes_por_categoria
+            """,
+            """
+            CREATE TABLE concorrentes_por_categoria AS
+            WITH totais AS (
+              SELECT
+                p.PROD_CATEGORY AS categoria,
+                ROUND(SUM(v.GROSS_SELLOUT), 2) AS faturamento_total_categoria
+              FROM vta v
+              JOIN prd p ON v.PROD_ID = p.PROD_ID
+              LEFT JOIN {PORTFOLIO_TABLE} ap
+                ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+               AND UPPER(TRIM(COALESCE(p.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+              WHERE p.PROD_CATEGORY IS NOT NULL
+              GROUP BY p.PROD_CATEGORY
+            ),
+            base AS (
+              SELECT
+                p.PROD_CATEGORY AS categoria,
+                COALESCE(NULLIF(p.PROD_MANUFACTURER, ''), NULLIF(p.PROD_BRAND, ''), 'SEM FABRICANTE') AS concorrente,
+                ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech,
+                ROUND(SUM(v.SALES_UNITS / NULLIF(ap.QTDE_CX, 0)), 0) AS caixas_vendidas,
+                ROUND(SUM(v.GROSS_SELLOUT), 2) AS faturamento
+              FROM vta v
+              JOIN prd p ON v.PROD_ID = p.PROD_ID
+              LEFT JOIN {PORTFOLIO_TABLE} ap
+                ON UPPER(TRIM(COALESCE(p.PROD_CATEGORY, ''))) = UPPER(TRIM(COALESCE(ap.PROD_CATEGORY, '')))
+               AND UPPER(TRIM(COALESCE(p.PROD_CLASIF_2, ''))) = UPPER(TRIM(COALESCE(ap.LITRAGEM, '')))
+              WHERE p.PROD_CATEGORY IS NOT NULL
+                AND UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) <> 'AQUAFAST'
+              GROUP BY p.PROD_CATEGORY, COALESCE(NULLIF(p.PROD_MANUFACTURER, ''), NULLIF(p.PROD_BRAND, ''), 'SEM FABRICANTE')
+            )
+            SELECT
+              base.categoria,
+              base.concorrente,
+              base.faturamento,
+              base.unidades_scanntech,
+              base.caixas_vendidas,
+              ROUND(base.faturamento / NULLIF(totais.faturamento_total_categoria, 0) * 100, 2) AS participacao_categoria_pct,
+              ROW_NUMBER() OVER (
+                PARTITION BY base.categoria
+                ORDER BY base.faturamento DESC, base.unidades_scanntech DESC, base.concorrente
+              ) AS ranking_categoria
+            FROM base
+            JOIN totais ON totais.categoria = base.categoria
+            ORDER BY base.categoria, ranking_categoria, base.concorrente
+            """,
+            """
+            DROP VIEW IF EXISTS share_aquafast_por_categoria
+            """,
+            """
+            DROP TABLE IF EXISTS share_aquafast_por_categoria
+            """,
+            """
+            CREATE TABLE share_aquafast_por_categoria AS
+            SELECT
+              p.PROD_CATEGORY AS categoria,
+              ROUND(SUM(v.GROSS_SELLOUT), 2) AS faturamento_total_categoria,
+              ROUND(SUM(CASE WHEN UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) = 'AQUAFAST' THEN v.GROSS_SELLOUT ELSE 0 END), 2) AS faturamento_aquafast,
+              ROUND(SUM(CASE WHEN UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) <> 'AQUAFAST' THEN v.GROSS_SELLOUT ELSE 0 END), 2) AS faturamento_concorrentes,
+              ROUND(
+                SUM(CASE WHEN UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) = 'AQUAFAST' THEN v.GROSS_SELLOUT ELSE 0 END)
+                / NULLIF(SUM(v.GROSS_SELLOUT), 0) * 100,
+                2
+              ) AS share_aquafast_pct,
+              ROUND(SUM(CASE WHEN UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) = 'AQUAFAST' THEN v.SALES_UNITS ELSE 0 END), 0) AS unidades_aquafast,
+              ROUND(SUM(CASE WHEN UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) <> 'AQUAFAST' THEN v.SALES_UNITS ELSE 0 END), 0) AS unidades_concorrentes
+            FROM vta v
+            JOIN prd p ON v.PROD_ID = p.PROD_ID
+            WHERE p.PROD_CATEGORY IS NOT NULL
+            GROUP BY p.PROD_CATEGORY
+            ORDER BY share_aquafast_pct DESC, faturamento_total_categoria DESC, categoria
+            """,
+            """
+            DROP VIEW IF EXISTS top_concorrentes_por_cidade
+            """,
+            """
+            DROP TABLE IF EXISTS top_concorrentes_por_cidade
+            """,
+            """
+            CREATE TABLE top_concorrentes_por_cidade AS
+            WITH base AS (
+              SELECT
+                COALESCE(d.PDV_LOCATION, 'SEM CIDADE') AS cidade,
+                COALESCE(d.PDV_STATE, 'SEM UF') AS uf,
+                COALESCE(NULLIF(p.PROD_MANUFACTURER, ''), NULLIF(p.PROD_BRAND, ''), 'SEM FABRICANTE') AS concorrente,
+                ROUND(SUM(v.GROSS_SELLOUT), 2) AS faturamento,
+                ROUND(SUM(v.SALES_UNITS), 0) AS unidades_scanntech
+              FROM vta v
+              JOIN pdv d ON v.PDV_ID = d.PDV_ID
+              JOIN prd p ON v.PROD_ID = p.PROD_ID
+              WHERE p.PROD_CATEGORY IS NOT NULL
+                AND UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) <> 'AQUAFAST'
+                AND d.PDV_LOCATION IS NOT NULL
+              GROUP BY
+                COALESCE(d.PDV_LOCATION, 'SEM CIDADE'),
+                COALESCE(d.PDV_STATE, 'SEM UF'),
+                COALESCE(NULLIF(p.PROD_MANUFACTURER, ''), NULLIF(p.PROD_BRAND, ''), 'SEM FABRICANTE')
+            ),
+            ranked AS (
+              SELECT
+                cidade,
+                uf,
+                concorrente,
+                faturamento,
+                unidades_scanntech,
+                ROW_NUMBER() OVER (
+                  PARTITION BY cidade, uf
+                  ORDER BY faturamento DESC, unidades_scanntech DESC, concorrente
+                ) AS ranking_cidade
+              FROM base
+            )
+            SELECT
+              cidade,
+              uf,
+              concorrente,
+              faturamento,
+              unidades_scanntech,
+              ranking_cidade
+            FROM ranked
+            ORDER BY cidade, ranking_cidade, concorrente
+            """,
+            """
+            DROP VIEW IF EXISTS concorrentes_crescimento_90_dias
+            """,
+            """
+            DROP TABLE IF EXISTS concorrentes_crescimento_90_dias
+            """,
+            """
+            CREATE TABLE concorrentes_crescimento_90_dias AS
+            WITH meses AS (
+              SELECT DISTINCT MONTH_ID
+              FROM vta
+              WHERE MONTH_ID IS NOT NULL
+              ORDER BY MONTH_ID DESC
+              LIMIT 6
+            ),
+            base AS (
+              SELECT
+                COALESCE(NULLIF(p.PROD_MANUFACTURER, ''), NULLIF(p.PROD_BRAND, ''), 'SEM FABRICANTE') AS concorrente,
+                p.PROD_CATEGORY AS categoria,
+                v.SALES_UNITS AS unidades,
+                v.GROSS_SELLOUT AS receita,
+                DENSE_RANK() OVER (ORDER BY v.MONTH_ID DESC) AS month_rank
+              FROM vta v
+              JOIN prd p ON v.PROD_ID = p.PROD_ID
+              JOIN meses m ON m.MONTH_ID = v.MONTH_ID
+              WHERE p.PROD_CATEGORY IS NOT NULL
+                AND UPPER(TRIM(COALESCE(p.PROD_MANUFACTURER, ''))) <> 'AQUAFAST'
+            ),
+            agg AS (
+              SELECT
+                concorrente,
+                categoria,
+                ROUND(SUM(CASE WHEN month_rank <= 3 THEN receita ELSE 0 END), 2) AS faturamento_90d,
+                ROUND(SUM(CASE WHEN month_rank BETWEEN 4 AND 6 THEN receita ELSE 0 END), 2) AS faturamento_90d_anterior,
+                ROUND(SUM(CASE WHEN month_rank <= 3 THEN unidades ELSE 0 END), 0) AS unidades_90d,
+                ROUND(SUM(CASE WHEN month_rank BETWEEN 4 AND 6 THEN unidades ELSE 0 END), 0) AS unidades_90d_anterior
+              FROM base
+              GROUP BY concorrente, categoria
+            )
+            SELECT
+              concorrente,
+              categoria,
+              faturamento_90d,
+              faturamento_90d_anterior,
+              ROUND(faturamento_90d - faturamento_90d_anterior, 2) AS variacao_abs,
+              ROUND((faturamento_90d - faturamento_90d_anterior) / NULLIF(faturamento_90d_anterior, 0) * 100, 2) AS variacao_pct,
+              unidades_90d,
+              unidades_90d_anterior
+            FROM agg
+            ORDER BY variacao_abs DESC, faturamento_90d DESC, concorrente, categoria
+            """,
+            """
             DROP VIEW IF EXISTS vendas_por_estado
             """,
             """
@@ -935,6 +2020,7 @@ def _bootstrap_compatibility_views() -> None:
         ]
         for statement in statements:
             cur.execute(statement)
+        _create_product_resolution_table(con)
         con.commit()
         cur.close()
         _SCHEMA_BOOTSTRAPPED = True
@@ -946,7 +2032,6 @@ def open_connection():
     if CHAT_BACKEND == "mysql":
         _bootstrap_compatibility_views()
         return mysql.connector.connect(**_mysql_config())
-    _bootstrap_duckdb_aquafast_views()
     if not DUCKDB_PATH.exists():
         raise FileNotFoundError(f"Banco nao encontrado: {DUCKDB_PATH}")
     return duckdb.connect(str(DUCKDB_PATH), read_only=True)
@@ -993,6 +2078,26 @@ def _execute_sql(con: Any, sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
 
 def run_query(sql: str, *, row_cap: int | None = None) -> dict[str, Any]:
     candidate = ensure_read_only_sql(sql.strip().rstrip(";"))
+    if _is_audit_products_without_subgroup_query(candidate):
+        con = open_connection()
+        try:
+            result = _audit_build_result(con)
+        finally:
+            con.close()
+        if row_cap is not None and row_cap > 0 and len(result["rows"]) > row_cap:
+            result = {**result, "rows": result["rows"][:row_cap], "truncated": True, "row_cap": row_cap}
+            result["row_count"] = len(result["rows"])
+            result["markdown"] = format_markdown(result["columns"], result["rows"])
+        return result
+
+    if _is_lojas_com_concorrente_sem_aquafast_query(candidate):
+        result = _build_lojas_com_concorrente_sem_aquafast_result()
+        if row_cap is not None and row_cap > 0 and len(result["rows"]) > row_cap:
+            result = {**result, "rows": result["rows"][:row_cap], "truncated": True, "row_cap": row_cap}
+            result["row_count"] = len(result["rows"])
+            result["markdown"] = format_markdown(result["columns"], result["rows"])
+        return result
+
     con = open_connection()
     try:
         truncated = False
@@ -1046,12 +2151,127 @@ def list_report_specs() -> list[dict[str, Any]]:
 
 
 def run_report(report_name: str, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+    if report_name == "historico_consultas":
+        spec = get_report_spec(report_name)
+        page = clamp_page(page)
+        page_size = clamp_page_size(page_size)
+        full_result = _build_historico_consultas_result()
+        total_rows = full_result["row_count"]
+        total_pages = math.ceil(total_rows / page_size) if total_rows else 0
+        offset = (page - 1) * page_size
+        page_rows = full_result["rows"][offset : offset + page_size]
+        page_result = {
+            **full_result,
+            "rows": page_rows,
+            "row_count": len(page_rows),
+            "markdown": format_markdown(full_result["columns"], page_rows),
+            "truncated": total_rows > len(page_rows),
+            "row_cap": page_size,
+        }
+        page_result = _attach_history_metadata(
+            page_result,
+            pergunta=spec["title"],
+            report_name=report_name,
+            rows_returned=len(page_rows),
+        )
+        return {
+            "report_name": report_name,
+            "title": spec["title"],
+            "description": spec["description"],
+            "sql": spec["sql"],
+            "base_sql": spec["sql"],
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "has_previous_page": page > 1,
+            "has_next_page": page < total_pages,
+            **page_result,
+        }
+
+    if report_name == "lojas_com_concorrente_sem_aquafast":
+        spec = get_report_spec(report_name)
+        page = clamp_page(page)
+        page_size = clamp_page_size(page_size)
+        full_result = _build_lojas_com_concorrente_sem_aquafast_result()
+        total_rows = full_result["row_count"]
+        total_pages = math.ceil(total_rows / page_size) if total_rows else 0
+        offset = (page - 1) * page_size
+        page_rows = full_result["rows"][offset : offset + page_size]
+        page_result = {
+            **full_result,
+            "rows": page_rows,
+            "row_count": len(page_rows),
+            "markdown": format_markdown(full_result["columns"], page_rows),
+            "truncated": total_rows > len(page_rows),
+            "row_cap": page_size,
+        }
+        page_result = _attach_history_metadata(
+            page_result,
+            pergunta=spec["title"],
+            report_name=report_name,
+            rows_returned=len(page_rows),
+        )
+        return {
+            "report_name": report_name,
+            "title": spec["title"],
+            "description": spec["description"],
+            "sql": spec["sql"],
+            "base_sql": spec["sql"],
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "has_previous_page": page > 1,
+            "has_next_page": page < total_pages,
+            **page_result,
+        }
+
     spec = get_report_spec(report_name)
-    base_sql = ensure_read_only_sql(spec["sql"])
     page = clamp_page(page)
     page_size = clamp_page_size(page_size)
-    offset = (page - 1) * page_size
+    base_sql = ensure_read_only_sql(spec["sql"])
 
+    if report_name == AUDIT_PRODUCTS_SENTINEL:
+        con = open_connection()
+        try:
+            full_result = _audit_build_result(con)
+        finally:
+            con.close()
+        total_rows = full_result["row_count"]
+        total_pages = math.ceil(total_rows / page_size) if total_rows else 0
+        offset = (page - 1) * page_size
+        page_rows = full_result["rows"][offset : offset + page_size]
+        page_result = {
+            **full_result,
+            "rows": page_rows,
+            "row_count": len(page_rows),
+            "markdown": format_markdown(full_result["columns"], page_rows),
+            "truncated": total_rows > len(page_rows),
+            "row_cap": page_size,
+        }
+        page_result = _attach_history_metadata(
+            page_result,
+            pergunta=spec["title"],
+            report_name=report_name,
+            rows_returned=len(page_rows),
+        )
+        return {
+            "report_name": report_name,
+            "title": spec["title"],
+            "description": spec["description"],
+            "sql": base_sql,
+            "base_sql": base_sql,
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "has_previous_page": page > 1,
+            "has_next_page": page < total_pages,
+            **page_result,
+        }
+
+    offset = (page - 1) * page_size
     count_sql = f"SELECT COUNT(*) AS total_rows FROM ({_strip_trailing_order_by(base_sql)}) AS report_data"
     page_sql = f"SELECT * FROM ({base_sql}) AS report_data LIMIT {page_size} OFFSET {offset}"
 
@@ -1060,6 +2280,12 @@ def run_report(report_name: str, page: int = 1, page_size: int = 50) -> dict[str
     total_pages = math.ceil(total_rows / page_size) if total_rows else 0
 
     page_result = run_query(page_sql)
+    page_result = _attach_history_metadata(
+        page_result,
+        pergunta=spec["title"],
+        report_name=report_name,
+        rows_returned=int(page_result.get("row_count", 0)),
+    )
     return {
         "report_name": report_name,
         "title": spec["title"],
@@ -1116,6 +2342,43 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
 
     q = normalize_business_question(question)
 
+    if any(
+        term in q
+        for term in [
+            "produtos sem subgrupo cigam",
+            "produtos sem padronizacao",
+            "auditoria produtos sem padronizacao",
+            "auditoria produtos sem padronização",
+            "quais produtos nao casam com o portfolio",
+            "quais produtos nao casam com o portifolio",
+        ]
+    ):
+        return (
+            "Auditoria produtos sem SUBGRUPO_CIGAM",
+            """
+            SELECT *
+            FROM auditoria_produtos_sem_subgrupo_cigam
+            ORDER BY faturamento DESC, caixas_vendidas DESC, ocorrencias DESC, produto_original_scanntech
+            """.strip(),
+        )
+
+    if any(term in q for term in ["historico de consultas", "historico consultas", "ultimas consultas", "quais relatorios eu consultei"]):
+        return (
+            "Historico de consultas",
+            """
+            SELECT
+                timestamp AS data_hora,
+                pergunta,
+                report_name AS relatorio,
+                metric,
+                rows_returned AS linhas_retornadas,
+                status
+            FROM aquafast_query_history
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 20
+            """.strip(),
+        )
+
     if any(term in q for term in ["ticket medio por cliente", "ticket por cliente", "ticket medio por cliente da aquafast"]):
         return (
             "Ticket medio por cliente Aquafast",
@@ -1131,9 +2394,20 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
         return (
             "Ticket medio por produto Aquafast",
             """
-            SELECT produto, preco_medio_caixa AS ticket_medio_caixa, unidades_scanntech, caixas_vendidas, receita_total, categoria, fabricante, marca
+            SELECT
+                produto_padrao,
+                produto_original_exemplo,
+                subgrupo_cigam,
+                variacoes_produto_original,
+                preco_medio_caixa AS ticket_medio_caixa,
+                unidades_scanntech,
+                caixas_vendidas,
+                receita_total,
+                categoria,
+                fabricante,
+                marca
             FROM ranking_produtos
-            ORDER BY preco_medio_caixa DESC, receita_total DESC, produto
+            ORDER BY preco_medio_caixa DESC, receita_total DESC, produto_padrao
             LIMIT 20
             """.strip(),
         )
@@ -1218,7 +2492,10 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             """
             WITH base AS (
                 SELECT
-                    produto,
+                    produto_padrao,
+                    produto_original_exemplo,
+                    subgrupo_cigam,
+                    variacoes_produto_original,
                     categoria,
                     fabricante,
                     marca,
@@ -1227,13 +2504,16 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
                     receita_total,
                     SUM(receita_total) OVER () AS receita_geral,
                     SUM(receita_total) OVER (
-                        ORDER BY receita_total DESC, produto
+                        ORDER BY receita_total DESC, produto_padrao
                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS receita_acumulada
                 FROM ranking_produtos
             )
             SELECT
-                produto,
+                produto_padrao,
+                produto_original_exemplo,
+                subgrupo_cigam,
+                variacoes_produto_original,
                 categoria,
                 fabricante,
                 marca,
@@ -1248,7 +2528,7 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
                     ELSE 'C'
                 END AS classe_abc
             FROM base
-            ORDER BY receita_total DESC, produto
+            ORDER BY receita_total DESC, produto_padrao
             LIMIT 50
             """.strip(),
         )
@@ -1307,7 +2587,57 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
         n = min(max(int(m_top_prd.group(1)), 1), 200)
         return (
             f"Top {n} produtos Aquafast por caixa",
-            f"SELECT * FROM ranking_produtos ORDER BY caixas_vendidas DESC, receita_total DESC, produto LIMIT {n}",
+            f"SELECT * FROM ranking_produtos ORDER BY total_vendas DESC, receita_total DESC, produto LIMIT {n}",
+        )
+
+    if any(term in q for term in ["concorrentes por categoria", "concorrente por categoria", "qual concorrente domina cada categoria", "qual concorrente domina categoria"]):
+        return (
+            "Concorrentes por categoria",
+            """
+            SELECT *
+            FROM concorrentes_por_categoria
+            ORDER BY categoria, ranking_categoria
+            """.strip(),
+        )
+
+    if any(term in q for term in ["share aquafast por categoria", "participacao aquafast por categoria", "participacao da aquafast por categoria", "qual a participacao da aquafast por categoria"]):
+        return (
+            "Share Aquafast por categoria",
+            """
+            SELECT *
+            FROM share_aquafast_por_categoria
+            ORDER BY share_aquafast_pct DESC, faturamento_total_categoria DESC, categoria
+            """.strip(),
+        )
+
+    if any(term in q for term in ["lojas com concorrente sem aquafast", "onde concorrente vende e aquafast nao", "quais lojas vendem concorrente mas nao vendem aquafast"]):
+        return (
+            "Lojas com concorrente sem Aquafast",
+            """
+            SELECT *
+            FROM lojas_com_concorrente_sem_aquafast
+            ORDER BY faturamento_concorrente DESC, unidades_scanntech DESC, loja, categoria, concorrente
+            """.strip(),
+        )
+
+    if any(term in q for term in ["top concorrentes por cidade", "concorrentes por cidade"]):
+        return (
+            "Top concorrentes por cidade",
+            """
+            SELECT *
+            FROM top_concorrentes_por_cidade
+            ORDER BY cidade, ranking_cidade
+            """.strip(),
+        )
+
+    if any(term in q for term in ["concorrentes crescimento 90 dias", "concorrentes em crescimento 90 dias", "qual concorrente mais cresce nos ultimos 90 dias"]):
+        return (
+            "Concorrentes em crescimento 90 dias",
+            """
+            SELECT *
+            FROM concorrentes_crescimento_90_dias
+            ORDER BY variacao_pct DESC, faturamento_90d DESC, concorrente, categoria
+            """.strip(),
         )
 
     if any(term in q for term in ["maior concorrente", "maiores concorrentes", "concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
@@ -1366,15 +2696,25 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
         )
 
     if any(term in q for term in ["top 20 produtos", "produtos mais vendidos", "ranking produtos"]):
-        return "Top produtos Aquafast por caixa", "SELECT * FROM ranking_produtos ORDER BY caixas_vendidas DESC, receita_total DESC, produto LIMIT 20"
+        return "Top produtos Aquafast por caixa", "SELECT * FROM ranking_produtos ORDER BY total_vendas DESC, receita_total DESC, produto LIMIT 20"
 
     if any(term in q for term in ["produtos por faturamento", "produtos aquafast por faturamento", "faturamento por produto", "produtos por receita", "ranking de receita por produto", "ranking de faturamento"]):
         return (
             "Receita por produto Aquafast (top 30)",
             """
-            SELECT produto, unidades_scanntech, caixas_vendidas, receita_total, categoria, fabricante, marca
+            SELECT
+                produto_padrao,
+                produto_original_exemplo,
+                subgrupo_cigam,
+                variacoes_produto_original,
+                unidades_scanntech,
+                caixas_vendidas,
+                receita_total,
+                categoria,
+                fabricante,
+                marca
             FROM ranking_produtos
-            ORDER BY receita_total DESC, caixas_vendidas DESC, produto
+            ORDER BY receita_total DESC, caixas_vendidas DESC, produto_padrao
             LIMIT 30
             """.strip(),
         )
@@ -1393,9 +2733,19 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
         return (
             "Produtos com maior volume (caixas)",
             """
-            SELECT produto, unidades_scanntech, caixas_vendidas, receita_total, categoria, fabricante, marca
+            SELECT
+                produto_padrao,
+                produto_original_exemplo,
+                subgrupo_cigam,
+                variacoes_produto_original,
+                unidades_scanntech,
+                caixas_vendidas,
+                receita_total,
+                categoria,
+                fabricante,
+                marca
             FROM ranking_produtos
-            ORDER BY unidades_scanntech DESC, caixas_vendidas DESC, receita_total DESC, produto
+            ORDER BY unidades_scanntech DESC, caixas_vendidas DESC, receita_total DESC, produto_padrao
             LIMIT 50
             """.strip(),
         )
@@ -1427,7 +2777,7 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
     if any(term in q for term in ["categoria", "litragem", "mix", "produto por categoria"]):
         return (
             "Produtos por categoria Aquafast",
-            "SELECT * FROM top_produtos_categoria ORDER BY caixas_vendidas DESC LIMIT 50",
+            "SELECT * FROM top_produtos_categoria ORDER BY caixas_vendidas DESC, produto_padrao LIMIT 50",
         )
 
     if (
@@ -1468,7 +2818,10 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
             "Produtos Aquafast com maior potencial de venda",
             """
             SELECT
-                produto,
+                produto_padrao,
+                produto_original_exemplo,
+                subgrupo_cigam,
+                variacoes_produto_original,
                 categoria,
                 fabricante,
                 marca,
@@ -1477,7 +2830,7 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
                 total_receita,
                 preco_medio_caixa
             FROM top_produtos_categoria
-            ORDER BY pdvs_com_venda DESC, caixas_vendidas DESC, total_receita DESC, produto
+            ORDER BY pdvs_com_venda DESC, caixas_vendidas DESC, total_receita DESC, produto_padrao
             LIMIT 20
             """.strip(),
         )
@@ -1497,7 +2850,7 @@ def legacy_question_to_sql(question: str) -> tuple[str, str]:
     if any(term in q for term in ["quantos produtos", "numero de produtos", "n??mero de produtos", "total de produtos distintos", "quantos skus", "produtos aquafast"]):
         return (
             "Total de produtos Aquafast",
-            "SELECT COUNT(DISTINCT produto) AS total_produtos FROM ranking_produtos",
+            "SELECT COUNT(DISTINCT produto_padrao) AS total_produtos FROM ranking_produtos",
         )
 
     if any(
@@ -1672,12 +3025,109 @@ def get_schema_snapshot() -> dict[str, Any]:
     }
 
 
+def _get_schema_snapshot_light() -> dict[str, Any]:
+    if CHAT_BACKEND == "mysql":
+        con = mysql.connector.connect(**_mysql_config())
+        try:
+            tables = _execute_sql(
+                con,
+                f"""
+                SELECT table_schema, table_name, table_type
+                FROM information_schema.tables
+                WHERE table_schema = '{MYSQL_DATABASE}'
+                ORDER BY table_schema, table_name
+                """,
+            )[1]
+            columns = _execute_sql(
+                con,
+                f"""
+                SELECT table_schema, table_name, column_name, data_type, ordinal_position
+                FROM information_schema.columns
+                WHERE table_schema = '{MYSQL_DATABASE}'
+                ORDER BY table_schema, table_name, ordinal_position
+                """,
+            )[1]
+        finally:
+            con.close()
+    else:
+        con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+        try:
+            tables = _execute_sql(
+                con,
+                """
+                SELECT table_schema, table_name, table_type
+                FROM information_schema.tables
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                ORDER BY table_schema, table_name
+                """,
+            )[1]
+            columns = _execute_sql(
+                con,
+                """
+                SELECT table_schema, table_name, column_name, data_type, ordinal_position
+                FROM information_schema.columns
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                ORDER BY table_schema, table_name, ordinal_position
+                """,
+            )[1]
+        finally:
+            con.close()
+
+    structured: list[dict[str, Any]] = []
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for schema, table, table_type in tables:
+        entry = {
+            "schema": schema,
+            "name": table,
+            "type": table_type,
+            "columns": [],
+        }
+        structured.append(entry)
+        index[(schema, table)] = entry
+
+    for schema, table, column_name, data_type, ordinal_position in columns:
+        entry = index.get((schema, table))
+        if entry is None:
+            continue
+        entry["columns"].append(
+            {
+                "name": column_name,
+                "type": data_type,
+                "position": ordinal_position,
+            }
+        )
+
+    lines = []
+    for entry in structured:
+        column_text = ", ".join(f"{col['name']}:{col['type']}" for col in entry["columns"])
+        lines.append(f"- {entry['name']} ({entry['type']}): {column_text}")
+
+    return {
+        "database": MYSQL_DATABASE if CHAT_BACKEND == "mysql" else DUCKDB_PATH.name,
+        "table_count": sum(1 for item in structured if item["type"] == "BASE TABLE"),
+        "view_count": sum(1 for item in structured if item["type"] == "VIEW"),
+        "object_count": len(structured),
+        "objects": structured,
+        "summary_text": "\n".join(lines),
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     try:
-        health_table = "vta" if CHAT_BACKEND == "mysql" else "scanntech"
-        total_registros = run_query(f"SELECT COUNT(*) AS total_registros FROM {health_table}")["rows"][0][0]
-        schema = get_schema_snapshot()
+        if CHAT_BACKEND == "mysql":
+            con = mysql.connector.connect(**_mysql_config())
+            try:
+                total_registros = _execute_sql(con, "SELECT COUNT(*) AS total_registros FROM vta")[1][0][0]
+            finally:
+                con.close()
+        else:
+            con = duckdb.connect(str(DUCKDB_PATH), read_only=True)
+            try:
+                total_registros = _execute_sql(con, "SELECT COUNT(*) AS total_registros FROM scanntech")[1][0][0]
+            finally:
+                con.close()
+        schema = _get_schema_snapshot_light()
         return {
             "ok": True,
             "db_path": MYSQL_DATABASE if CHAT_BACKEND == "mysql" else DUCKDB_PATH.name,
@@ -1747,12 +3197,15 @@ def query(request: SQLRequest) -> dict[str, Any]:
     try:
         sql = ensure_read_only_sql(request.sql)
         query_result = run_query(sql, row_cap=QUERY_RESULT_ROW_CAP)
+        title = request.title.strip() or "Consulta SQL"
+        route_meta = _route_metadata_for_response("", title, sql)
         return {
             "ok": True,
-            "title": request.title.strip() or "Consulta SQL",
+            "title": title,
             "question": "",
             "sql": sql,
-            "source_note": _build_source_note_clean("", request.title.strip() or "Consulta SQL", sql),
+            "source_note": _build_source_note_clean("", title, sql),
+            **route_meta,
             **query_result,
         }
     except Exception as exc:
@@ -1793,13 +3246,27 @@ def download(file_name: str) -> FileResponse:
 def ask(request: QuestionRequest) -> dict[str, Any]:
     try:
         title, sql = legacy_question_to_sql(request.question)
+        route_meta = _route_metadata_for_response(request.question, title, sql)
+        report_name = route_meta["report_name"] or _infer_report_name_from_sql(sql) or ""
         result = run_query(sql, row_cap=QUERY_RESULT_ROW_CAP)
+        history_result = (
+            _attach_history_metadata(
+                result,
+                pergunta=request.question,
+                report_name=report_name,
+                rows_returned=int(result.get("row_count", 0)),
+            )
+            if report_name
+            else {}
+        )
         return {
             "ok": True,
             "title": title,
             "question": request.question,
             "sql": sql,
             "source_note": _build_source_note_clean(request.question, title, sql),
+            **route_meta,
+            **history_result,
             **result,
         }
     except Exception as exc:

@@ -9,32 +9,86 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
+import sys
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, "/app/backend")
 
 import httpx
 from pydantic import BaseModel, Field
 
 try:
-    from aquafast_semantics import normalize_business_question, repair_mojibake
+    from aquafast_semantics import (
+        OFFICIAL_QUESTION_ROUTES,
+        normalize_business_question,
+        repair_mojibake,
+        match_route,
+        resolve_official_route,
+        safe_output_text,
+    )
 except Exception:
-    def repair_mojibake(text: str) -> str:
-        if not isinstance(text, str):
-            return text
-        if not any(marker in text for marker in ("Ã", "Â", "ï¿½")):
-            return text
-        try:
-            repaired = text.encode("latin1").decode("utf-8")
-        except Exception:
-            return text
-        return repaired or text
+    OFFICIAL_QUESTION_ROUTES: tuple[Any, ...] = tuple()
 
+    def safe_output_text(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        if not text:
+            return ""
+        stripped = text.strip()
+        if not stripped or stripped.lower() == "none":
+            return ""
+        repaired = text
+        for _ in range(3):
+            next_text = repaired
+            for encoding in ("latin1", "cp1252"):
+                try:
+                    next_text = next_text.encode(encoding).decode("utf-8")
+                    break
+                except Exception:
+                    pass
+            for bad, good in (
+                ("ÃƒÂª", "ê"),
+                ("ÃƒÂ³", "ó"),
+                ("ÃƒÂ­", "í"),
+                ("ÃƒÂ§", "ç"),
+                ("ÃƒÂ£", "ã"),
+                ("ÃƒÂ¡", "á"),
+                ("ÃƒÂ©", "é"),
+                ("Ãª", "ê"),
+                ("Ã³", "ó"),
+                ("Ã­", "í"),
+                ("Ã§", "ç"),
+                ("Ã£", "ã"),
+                ("Ã¡", "á"),
+                ("Ã©", "é"),
+                ("Âº", "º"),
+                ("Âª", "ª"),
+                ("Â·", "·"),
+            ):
+                next_text = next_text.replace(bad, good)
+            if next_text == repaired:
+                break
+            repaired = next_text
+        return repaired
+
+    def safe_output_text(text: Any) -> str:
+        if text is None:
+            return ''
+        try:
+            return str(text)
+        except Exception:
+            return ''
 
     def normalize_business_question(text: str) -> str:
-        q = repair_mojibake(text)
+        q = safe_output_text(text)
         q = unicodedata.normalize("NFKD", q)
         q = q.encode("ascii", "ignore").decode("ascii")
         q = " ".join(q.strip().lower().split())
+        q = q.replace("_", " ")
         replacements = (
             (r"\bpontos de venda\b", "lojas"),
             (r"\bpdv?s?\b", "lojas"),
@@ -52,116 +106,219 @@ except Exception:
             q = re.sub(pattern, replacement, q)
         return " ".join(q.split())
 
+    def match_route(question: str) -> str | None:
+        return None
+
+    def resolve_official_route(question: str):
+        return None
+
+
+def safe_text(text: Any) -> str:
+    value = "" if text is None else str(text)
+    if not value:
+        return ""
+    if "Ã" not in value and "Â" not in value:
+        return value
+    try:
+        repaired = value.encode("latin1").decode("utf-8")
+    except Exception:
+        return value
+    return repaired or value
+
 
 AVAILABLE_QUESTION_SUGGESTIONS: tuple[dict[str, str], ...] = (
-    {
-        "title": "Lojas com 1 compra",
-        "content": "Mostre as lojas da Aquafast com apenas 1 compra",
-    },
-    {
-        "title": "Redes com Aquafast",
-        "content": "Mostre as redes que vendem Aquafast",
-    },
-    {
-        "title": "Vendas por estado",
-        "content": "Mostre as vendas da Aquafast por estado",
-    },
-    {
-        "title": "Top lojas Aquafast",
-        "content": "Mostre o top de lojas Aquafast por caixa",
-    },
-    {
-        "title": "Quantas lojas a Aquafast tem hoje?",
-        "content": "Quantas lojas a Aquafast tem hoje?",
-    },
-    {
-        "title": "Em quantos pontos de venda a Aquafast está presente hoje?",
-        "content": "Em quantos pontos de venda a Aquafast está presente hoje?",
-    },
-    {
-        "title": "Qual o maior concorrente da Aquafast?",
-        "content": "Qual o maior concorrente da Aquafast?",
-    },
-    {
-        "title": "Quais produtos teriam mais potencial de venda?",
-        "content": "Quais produtos teriam mais potencial de venda?",
-    },
-    {
-        "title": "Top 20 produtos mais vendidos",
-        "content": "Top 20 produtos mais vendidos",
-    },
-    {
-        "title": "Top 20 clientes por valor",
-        "content": "Top 20 clientes por valor",
-    },
-    {
-        "title": "Vendas por mês",
-        "content": "Mostre as vendas da Aquafast por mês",
-    },
-    {
-        "title": "Vendas por cidade",
-        "content": "Mostre as vendas da Aquafast por cidade",
-    },
-    {
-        "title": "Vendas por UF",
-        "content": "Mostre as vendas da Aquafast por UF",
-    },
-    {
-        "title": "Produtos por faturamento",
-        "content": "Mostre os produtos Aquafast por faturamento",
-    },
-    {
-        "title": "Produtos por quantidade",
-        "content": "Mostre os produtos Aquafast por quantidade",
-    },
-    {
-        "title": "Clientes com maior faturamento",
-        "content": "Mostre os clientes com maior faturamento da Aquafast",
-    },
-    {
-        "title": "Clientes com menor compra",
-        "content": "Mostre os clientes com menor compra da Aquafast",
-    },
-    {
-        "title": "Ticket médio por cliente",
-        "content": "Mostre o ticket médio por cliente da Aquafast",
-    },
-    {
-        "title": "Ticket médio por produto",
-        "content": "Mostre o ticket médio por produto da Aquafast",
-    },
-    {
-        "title": "Última venda por produto",
-        "content": "Mostre a última venda por produto da Aquafast",
-    },
-    {
-        "title": "Primeira e última venda da base",
-        "content": "Mostre a primeira e a última venda da base Aquafast",
-    },
-    {
-        "title": "Curva ABC de produtos",
-        "content": "Mostre a curva ABC de produtos da Aquafast",
-    },
-    {
-        "title": "Curva ABC de clientes",
-        "content": "Mostre a curva ABC de clientes da Aquafast",
-    },
+    {"title": "Insights de Vendas", "content": "Quais foram os produtos mais vendidos no último mês?"},
+    {"title": "Insights de Vendas", "content": "Mostre a evolução de vendas da Aquafast por mês."},
+    {"title": "Insights de Vendas", "content": "Quais clientes mais compraram Aquafast?"},
+    {"title": "Análise de Concorrência", "content": "Compare a Aquafast com os principais concorrentes."},
+    {"title": "Mapa de Oportunidades", "content": "Quais produtos têm maior oportunidade de crescimento?"},
+    {"title": "Insights de Vendas", "content": "Quais estados têm melhor desempenho de vendas?"},
+    {"title": "Auditoria de Dados", "content": "Existem produtos sem subgrupo ou com dados inconsistentes?"},
+    {"title": "Performance de Produtos", "content": "Mostre um resumo executivo da performance comercial."},
 )
 
 PRIMARY_QUESTION_PROMPTS: tuple[str, ...] = (
-    "Mostre os produtos Aquafast por faturamento",
-    "Top 20 produtos mais vendidos",
-    "Top 20 clientes por valor",
-    "Mostre as vendas da Aquafast por mês",
-    "Mostre as vendas da Aquafast por cidade",
-    "Mostre a curva ABC de produtos da Aquafast",
+    "Insights de Vendas",
+    "Performance de Produtos",
+    "Análise de Concorrência",
+    "Mapa de Oportunidades",
+    "Auditoria de Dados",
+    "Quais foram os produtos mais vendidos no último mês?",
+    "Mostre a evolução de vendas da Aquafast por mês.",
+    "Quais clientes mais compraram Aquafast?",
+    "Compare a Aquafast com os principais concorrentes.",
+    "Quais produtos têm maior oportunidade de crescimento?",
 )
+
+
+AGENT_GROUPS: tuple[dict[str, Any], ...] = (
+    {
+        "title": "Insights de Vendas",
+        "label": "Insights de Vendas",
+        "description": "Análise de vendas, faturamento, evolução mensal e desempenho por cliente/UF.",
+        "aliases": ("insights vendas", "vendas aquafast", "performance vendas", "ranking lojas", "vendas"),
+        "questions": (
+            "Quais foram os produtos mais vendidos no último mês?",
+            "Mostre a evolução de vendas da Aquafast por mês.",
+            "Quais clientes mais compraram Aquafast?",
+            "Quais estados têm melhor desempenho de vendas?",
+        ),
+    },
+    {
+        "title": "Performance de Produtos",
+        "label": "Performance de Produtos",
+        "description": "Ranking de SKU, categorias, volume em caixas e leitura executiva de portfólio.",
+        "aliases": ("performance produtos", "produtos aquafast", "ranking produtos", "portfolio", "produto", "sku"),
+        "questions": (
+            "Quais foram os produtos mais vendidos no último mês?",
+            "Mostre um resumo executivo da performance comercial.",
+        ),
+    },
+    {
+        "title": "Análise de Concorrência",
+        "label": "Análise de Concorrência",
+        "description": "Comparação com concorrentes, participação de mercado e posicionamento comercial.",
+        "aliases": ("concorrencia", "market share", "competidores", "posicionamento", "share", "mercado"),
+        "questions": (
+            "Compare a Aquafast com os principais concorrentes.",
+        ),
+    },
+    {
+        "title": "Mapa de Oportunidades",
+        "label": "Mapa de Oportunidades",
+        "description": "Identificação de potencial de crescimento, lacunas de cobertura e prioridade de atuação.",
+        "aliases": ("oportunidades", "potencial venda", "gaps cobertura", "crescimento", "oportunidade", "gap"),
+        "questions": (
+            "Quais produtos têm maior oportunidade de crescimento?",
+        ),
+    },
+    {
+        "title": "Auditoria de Dados",
+        "label": "Auditoria de Dados",
+        "description": "Validação de integridade da base, inconsistências e problemas de classificação.",
+        "aliases": (
+            "auditoria dados",
+            "qualidade dados",
+            "integridade",
+            "padronizacao",
+            "auditoria",
+            "inconsistencia",
+            "sem subgrupo",
+            "diagnostico",
+        ),
+        "questions": (
+            "Existem produtos sem subgrupo ou com dados inconsistentes?",
+        ),
+    },
+)
+
+GROUP_INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Insights de Vendas": (
+        "venda", "vendas", "sell-out", "faturamento", "clientes", "estado", "uf", "mes", "evolucao", "crescimento", "queda",
+    ),
+    "Performance de Produtos": (
+        "produto", "sku", "ranking", "categoria", "subgrupo", "mix", "embalagem", "volume", "caixas",
+    ),
+    "Análise de Concorrência": (
+        "concorrencia", "concorrente", "share", "participacao", "mercado", "comparacao", "marcas", "market share",
+    ),
+    "Mapa de Oportunidades": (
+        "oportunidade", "potencial", "expansao", "crescer", "priorizar", "lacuna", "gap", "onde atuar",
+    ),
+    "Auditoria de Dados": (
+        "auditoria", "inconsistencia", "qualidade", "sem subgrupo", "erro", "divergencia", "historico", "diagnostico",
+    ),
+}
+
+OFF_TOPIC_SIGNALS: tuple[str, ...] = (
+    "capital",
+    "presidente",
+    "historia",
+    "geografia",
+    "receita",
+    "culinaria",
+    "esporte",
+    "clima",
+    "tempo",
+    "temperatura",
+    "traducao",
+    "significado",
+    "definicao",
+    "quem inventou",
+    "quando nasceu",
+    "filme",
+    "musica",
+    "livro",
+)
+
+ROUTE_TO_LABEL: dict[str, str] = {
+    "lojas_hoje": "Lojas na base",
+    "pontos_venda": "Pontos de venda",
+    "top_clientes": "Top clientes",
+    "top_produtos": "Top produtos",
+    "receita_total": "Faturamento total",
+    "ticket_medio": "Ticket medio",
+    "vendas_mes": "Vendas por mes",
+    "vendas_estado": "Vendas por estado",
+    "vendas_por_cidade": "Presença por cidade",
+    "ranking_redes": "Ranking de redes",
+    "total_produtos": "Total de produtos",
+    "resumo_geral": "Resumo geral",
+    "market_share": "Market share",
+    "maior_concorrente": "Maior concorrente",
+    "maior_estado": "Maior estado",
+    "lojas_90d": "Lojas ativas 90 dias",
+    "potencial_venda": "Potencial de venda",
+    "lojas_com_concorrente_sem_aquafast": "Oportunidades",
+}
+
+INTENT_ROUTER_SYSTEM_PROMPT = """
+Você é um roteador de intenções para um sistema de dados de varejo.
+Sua única função é identificar qual tipo de análise o usuário quer.
+
+Responda APENAS com uma das categorias abaixo, sem nenhum texto adicional:
+- top_produtos
+- top_clientes
+- ranking_redes
+- receita_total
+- lojas_hoje
+- market_share
+- concorrentes_por_categoria
+- oportunidades
+- evolucao_mensal
+- resumo_geral
+- fora_de_contexto
+
+Exemplos:
+- "quais produtos mais vendem" -> top_produtos
+- "como estão as vendas" -> evolucao_mensal
+- "aquafast vs concorrentes" -> concorrentes_por_categoria
+
+Não explique. Não invente dados. Não use conhecimento próprio.
+Se a pergunta não for sobre dados de varejo, responda: fora_de_contexto
+""".strip()
+
+FORMAT_WITH_LLM_SYSTEM_PROMPT = "Você é um analista de dados de varejo."
+
+FORMAT_WITH_LLM_USER_PROMPT_TEMPLATE = """
+Você é um analista de dados de varejo. Responda a pergunta do usuário
+usando EXCLUSIVAMENTE os dados abaixo. Não adicione informações externas.
+Não invente números. Se os dados não responderem a pergunta, diga
+"Os dados disponíveis não cobrem essa análise."
+
+Pergunta: {question}
+
+Dados reais da base:
+{data}
+
+Responda de forma clara e executiva, em português.
+""".strip()
 
 
 class Pipe:
     # Invariante do projeto:
     # - O nome visivel e a porta de entrada principal precisam permanecer como "Scanntech Analyst".
-    # - O modelo interno continua sendo qwen2.5:latest, mas so para raciocinio e resposta.
+    # - O modelo interno continua sendo llama3.2:3b, mas so para raciocinio e resposta.
     class Valves(BaseModel):
         API_BASE_URL: str = Field(
             default="http://scanntech-api:8000",
@@ -172,7 +329,7 @@ class Pipe:
             description="Base URL do Ollama local",
         )
         CHAT_MODEL: str = Field(
-            default="qwen2.5:latest",
+            default="llama3.2:3b",
             description="Modelo usado para conversa livre e geracao de SQL",
         )
         TIMEOUT_SECONDS: float = Field(
@@ -229,7 +386,7 @@ class Pipe:
         return [{"id": "scanntech_analyst", "name": "Scanntech Analyst"}]
 
     def _normalize_text(self, text: str) -> str:
-        text = repair_mojibake(text)
+        text = safe_output_text(text)
         normalized = unicodedata.normalize("NFKD", text)
         ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
         return " ".join(ascii_text.lower().split())
@@ -238,7 +395,7 @@ class Pipe:
         if content is None:
             return ""
         if isinstance(content, str):
-            return repair_mojibake(content)
+            return safe_output_text(content)
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
@@ -290,10 +447,10 @@ class Pipe:
         return self._contains_any(q, access_terms)
 
     def _answer_access_question(self) -> str:
-        return repair_mojibake(
-            "Tenho acesso ao banco local do projeto Aquafast conectado ao DuckDB e à API interna da stack. "
-            "Consigo consultar os dados ingeridos no ambiente local, gerar análises, gráficos e exportações. "
-            "Não tenho acesso a bases externas ou confidenciais fora deste ambiente."
+        return safe_output_text(
+            "Tenho acesso ao banco local do projeto Aquafast conectado ao DuckDB e Ã  API interna da stack. "
+            "Consigo consultar os dados ingeridos no ambiente local, gerar anÃ¡lises, grÃ¡ficos e exportaÃ§Ãµes. "
+            "NÃ£o tenho acesso a bases externas ou confidenciais fora deste ambiente."
         )
     def _is_excel_request(self, question: str) -> bool:
         q = self._normalize_text(question)
@@ -317,7 +474,7 @@ class Pipe:
     def _safe_text(self, value: Any, default: str = "") -> str:
         if value is None:
             return default
-        text = repair_mojibake(value) if isinstance(value, str) else str(value)
+        text = safe_output_text(value) if isinstance(value, str) else str(value)
         if text is None:
             return default
         cleaned = str(text).strip()
@@ -325,11 +482,58 @@ class Pipe:
             return default
         return cleaned
 
+    def _route_for_category(self, category: str):
+        normalized = self._normalize_text(category)
+        if not normalized:
+            return None
+        category_map = {
+            "top_produtos": "top_produtos",
+            "top_clientes": "top_clientes",
+            "ranking_redes": "ranking_redes",
+            "receita_total": "receita_total",
+            "lojas_hoje": "lojas_hoje",
+            "market_share": "market_share",
+            "concorrentes_por_categoria": "concorrentes_por_categoria",
+            "oportunidades": "lojas_com_concorrente_sem_aquafast",
+            "evolucao_mensal": "vendas_mes",
+            "resumo_geral": "resumo_geral",
+        }
+        route_id = category_map.get(normalized, normalized)
+        for route in OFFICIAL_QUESTION_ROUTES:
+            if route.id == route_id:
+                return route
+        return None
+
+    def _route_for_question(self, question: str, category: str | None = None):
+        route = resolve_official_route(question)
+        if route is not None:
+            return route
+        route_id = match_route(question)
+        if route_id:
+            for route in OFFICIAL_QUESTION_ROUTES:
+                if route.id == route_id:
+                    return route
+        if category:
+            route = self._route_for_category(category)
+            if route is not None:
+                return route
+        return None
+
+    def _inline_prompt(self, value: Any, default: str = "") -> str:
+        # Open WebUI nao oferece uma acao de clique do pipe que execute a pergunta na mesma conversa.
+        # Por isso renderizamos opcoes copiaveis como inline code spans em vez de links de navegacao.
+        text = safe_text(value)
+        cleaned = text or default
+        if not cleaned:
+            return default
+        escaped = cleaned.replace("`", "\\`")
+        return f"`{escaped}`"
+
     def _selected_questions(self, limit: int | None = None) -> list[dict[str, str]]:
         items = [
             {
-                "title": self._safe_text(item.get("title", ""), ""),
-                "content": self._safe_text(item.get("content", ""), ""),
+                "title": safe_text(item.get("title", "")),
+                "content": safe_text(item.get("content", "")),
             }
             for item in AVAILABLE_QUESTION_SUGGESTIONS
         ]
@@ -367,18 +571,18 @@ class Pipe:
 
     def _format_questions_block(self, limit: int | None = None) -> str:
         selected = self._selected_questions(limit=limit)
-        lines = ["Perguntas disponíveis:", ""]
+        lines = [safe_text("Perguntas disponíveis:"), ""]
         for idx, item in enumerate(selected, start=1):
-            title = self._safe_text(item.get("title", ""), "Pergunta")
-            content = self._safe_text(item.get("content", ""), title)
+            title = safe_text(item.get("title", ""))
+            content = safe_text(item.get("content", "")) or title
             if limit is None:
-                lines.append(f"{idx}. {title}")
+                lines.append(f"{idx}. {self._inline_prompt(title)}")
                 if content and content != title:
-                    lines.append(f"   {content}")
+                    lines.append(f"   {self._inline_prompt(content)}")
             else:
-                lines.append(f"- `{content}`")
+                lines.append(f"- {self._inline_prompt(content)}")
         lines.append("")
-        lines.append("Digite: `Mostrar perguntas disponíveis`")
+        lines.append(safe_text("Digite uma opção acima ou use `Mostrar perguntas disponíveis`."))
         return "\n".join(lines).strip()
 
     def _is_available_questions_request(self, question: str) -> bool:
@@ -398,15 +602,15 @@ class Pipe:
     def _answer_available_questions(self) -> str:
         lines = ["## Perguntas disponíveis", ""]
         for idx, item in enumerate(AVAILABLE_QUESTION_SUGGESTIONS, start=1):
-            title = repair_mojibake(item["title"])
-            content = repair_mojibake(item["content"])
+            title = safe_text(item["title"])
+            content = safe_text(item["content"])
             lines.append(f"{idx}. {title}")
             if content and content != title:
                 lines.append(f"   {content}")
         lines.append("")
         lines.append(
-            "Se quiser ver a lista completa na interface, clique em uma sugestão ou pergunte: "
-            '"Mostrar perguntas disponíveis".'
+            "Se quiser ver a lista completa na interface, clique em uma sugestÃ£o ou pergunte: "
+            '"Mostrar perguntas disponÃ­veis".'
         )
         return "\n".join(lines).strip()
 
@@ -428,12 +632,12 @@ class Pipe:
             "email",
             "e-mail",
             "paragrafo",
-            "parÃ¡grafo",
+            "parÃƒÂ¡grafo",
             "frase",
             "prompt",
             "documento",
             "relatorio",
-            "relatÃ³rio",
+            "relatÃƒÂ³rio",
         ]
         if any(re.search(rf"\\b{re.escape(v)}\\b", q) for v in edit_verbs) and self._contains_any(q, edit_objects):
             return True
@@ -475,7 +679,7 @@ class Pipe:
             r"\b(como funciona|como voce funciona|explique|resuma|escreva|revise|melhore|ajude|traduza)\b",
             r"\b(tem acesso|acesso a base|acessar a base|consegue acessar|voce tem acesso)\b",
             r"\b(quem e voce|qual sua funcao|o que e|por que|porque)\b",
-            r"^\s*(oi|ol[aÃ¡]|bom dia|boa tarde|boa noite|obrigado|valeu)\s*[!?.,]*\s*$",
+            r"^\s*(oi|ol[áa]|bom dia|boa tarde|boa noite|obrigado|valeu)\s*[!?.,]*\s*$",
         ]
 
         # evita falso positivo de substring (ex.: "melhores" vs "melhore")
@@ -495,6 +699,9 @@ class Pipe:
     def _looks_like_data_question(self, question: str) -> bool | None:
         q = normalize_business_question(question)
         q = self._normalize_text(q)
+
+        if any(signal in q for signal in OFF_TOPIC_SIGNALS):
+            return False
 
         data_terms = [
             "cliente",
@@ -575,6 +782,21 @@ class Pipe:
             "portfolio",
             "aquafast",
             "litragem",
+            "sell-out",
+            "evolucao",
+            "crescimento",
+            "queda",
+            "subgrupo",
+            "inconsistencia",
+            "divergencia",
+            "diagnostico",
+            "oportunidade",
+            "potencial",
+            "lacuna",
+            "gap",
+            "resumo executivo",
+            "participacao de mercado",
+            "market share",
         ]
 
         chat_terms = [
@@ -603,7 +825,7 @@ class Pipe:
         data_patterns = [
             r"\b(top|ranking|lista|listar|mostrar|mostre|quais|qual|quantos|quanto|maior|maiores|menor|menores|melhor|piores)\b",
             r"\b(cliente|clientes|produto|produtos|sku|venda|vendas|receita|faturamento|ticket|churn)\b",
-            r"\b(razao social|cnpj|uf|cidade|canal|mes|m[eÃª]s|periodo)\b",
+            r"\b(razao social|cnpj|uf|cidade|canal|mes|m[eÃƒÂª]s|periodo)\b",
             r"\b(mais vendidos|mais comprados|valor total|ticket medio)\b",
         ]
         chat_patterns = [
@@ -671,19 +893,19 @@ class Pipe:
 
     def _looks_like_period_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["periodo", "periodos", "quando", "mes", "mÃªs", "data", "primeira", "ultima"])
+        return any(term in q for term in ["periodo", "periodos", "quando", "mes", "mÃƒÂªs", "data", "primeira", "ultima"])
 
     def _looks_like_client_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["cliente", "clientes", "razao social", "razÃ£o social", "cnpj"])
+        return any(term in q for term in ["cliente", "clientes", "razao social", "razÃƒÂ£o social", "cnpj"])
 
     def _looks_like_city_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["cidade", "cidades", "municipio", "municÃ­pio", "uf", "estado"])
+        return any(term in q for term in ["cidade", "cidades", "municipio", "municÃƒÂ­pio", "uf", "estado"])
 
     def _looks_like_product_name_question(self, question: str) -> bool:
         q = self._normalize_text(question)
-        # _normalize_text remove acentos, entao "descriÃ§Ã£o" vira "descricao"
+        # _normalize_text remove acentos, entao "descriÃƒÂ§ÃƒÂ£o" vira "descricao"
         return any(term in q for term in ["nome", "descricao", "desc_produto", "descr"])
 
     def _looks_like_ticket_question(self, question: str) -> bool:
@@ -941,7 +1163,7 @@ class Pipe:
 
     def _is_product_request(self, question: str) -> bool:
         q = self._normalize_text(question)
-        return any(term in q for term in ["produto", "produtos", "item", "itens", "sku", "codigo", "cÃ³digo"])
+        return any(term in q for term in ["produto", "produtos", "item", "itens", "sku", "codigo", "cÃƒÂ³digo"])
 
     def _sql_looks_like_row_level(self, sql: str) -> bool:
         s = self._normalize_text(sql)
@@ -1023,6 +1245,9 @@ class Pipe:
                 return col
         return columns[0]
 
+    def _finalize_output(self, text: str) -> str:
+        return safe_output_text(text)
+
     def _format_metric(self, value: float, metric_col: str | None) -> str:
         metric = (metric_col or "").lower()
         if any(k in metric for k in ["receita", "faturamento", "valor_total", "valor total"]):
@@ -1098,6 +1323,29 @@ class Pipe:
                 "Fonte: `top_produtos_categoria`. "
                 "A consulta usa a presenca em PDVs e o volume em caixas como proxy de potencial de venda."
             )
+        if any(
+            term in text
+            for term in [
+                "lojas com concorrente sem aquafast",
+            ]
+        ):
+            return (
+                "Fonte: `lojas_com_concorrente_sem_aquafast`. "
+                "A consulta usa PDV_ID como chave principal e expÃµe `status_loja` quando a ligaÃƒÂ§ÃƒÂ£o nao existir."
+            )
+        if any(
+            term in text
+            for term in [
+                "concorrentes por categoria",
+                "share aquafast por categoria",
+                "top concorrentes por cidade",
+                "concorrentes em crescimento 90 dias",
+            ]
+        ):
+            return (
+                "Fonte: views deterministicas de concorrencia. "
+                "A consulta usa o universo do mercado carregado e separa Aquafast de concorrentes sem chamar LLM."
+            )
         if any(term in text for term in ["maior concorrente", "concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
             return (
                 "Fonte: `ms_mercado_aquafast`. "
@@ -1116,9 +1364,10 @@ class Pipe:
         if any(term in text for term in ["produto por categoria", "categoria", "litragem", "mix"]):
             return (
                 "Fonte: `top_produtos_categoria`. "
-                "A consulta cruza o portfolio Aquafast com caixas para enxergar o mix por categoria."
+                "A consulta cruza o portfolio Aquafast com caixas para enxergar o mix por categoria, "
+                "consolidando pelo mapeamento oficial de `SUBGRUPO_CIGAM`."
             )
-        if any(term in text for term in ["vendas por mes", "vendas por mÃªs", "mensal", "serie mensal", "sÃ©rie mensal"]):
+        if any(term in text for term in ["vendas por mes", "vendas por mÃƒÂªs", "mensal", "serie mensal", "sÃƒÂ©rie mensal"]):
             return (
                 "Fonte: `vendas_por_mes`. "
                 "A consulta consolida caixas e receita ao longo do tempo para mostrar tendencia mensal."
@@ -1131,7 +1380,18 @@ class Pipe:
         if any(term in text for term in ["top produtos", "ranking produtos", "mais vendidos", "receita por produto", "volume de vendas"]):
             return (
                 "Fonte: `ranking_produtos`. "
-                "A consulta lista os produtos Aquafast com maior volume em caixas e receita."
+                "A consulta lista os produtos Aquafast com maior volume em caixas e receita, "
+                "consolidando pelo mapeamento oficial de `SUBGRUPO_CIGAM`."
+            )
+        if any(term in text for term in ["subgrupo cigam", "padronizacao", "padronizaÃ§Ã£o", "nao casam com o portfolio", "nao casam com o portifolio"]):
+            return (
+                "Fonte: `auditoria_produtos_sem_subgrupo_cigam`. "
+                "A consulta lista os produtos Aquafast sem correspondencia no portfolio e sugere `SUBGRUPO_CIGAM` apenas quando a similaridade e transparente."
+            )
+        if any(term in text for term in ["historico de consultas", "historico consultas", "ultimas consultas", "quais relatorios eu consultei"]):
+            return (
+                "Fonte: `aquafast_query_history`. "
+                "A consulta mostra as 20 consultas deterministicas mais recentes registradas pelo Scanntech Analyst."
             )
         if any(term in text for term in ["clientes", "lojas", "churn", "compra"]):
             return (
@@ -1139,6 +1399,16 @@ class Pipe:
                 "A consulta resume as lojas Aquafast por caixas vendidas, receita e recorrencia."
             )
         return "Fonte: consulta local no DuckDB usando as views semanticas da Aquafast."
+
+    def _history_block_from_result(self, question: str, result: dict[str, Any]) -> str:
+        report_name = str(result.get("history_report_name", "") or "").strip()
+        timestamp = str(result.get("history_timestamp", "") or "").strip()
+        if not report_name and not timestamp:
+            return ""
+        lines = ["Historico desta consulta:", f"- relatorio: {report_name or 'desconhecido'}", f"- pergunta: {question or ''}"]
+        if timestamp:
+            lines.append(f"- executado em: {timestamp}")
+        return "\n".join(lines)
 
     def _ensure_select_only(self, sql: str) -> str:
         normalized = self._normalize_text(sql)
@@ -1309,83 +1579,130 @@ class Pipe:
         content = str(message.get("content", "")).strip()
         return content or "Analise concluida."
 
-    async def _ask_chat(self, body: dict, question: str) -> str:
-        messages = body.get("messages", [])[-self.valves.MAX_MESSAGES :]
-        chat_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Voce e o Aquafast IA (modo conversa, sem consulta SQL nesta rodada). "
-                    "Responda em portugues, de forma util e curta. "
-                    "NUNCA invente numeros, totais, rankings, nomes de clientes ou produtos, nem datas de vendas. "
-                    "A regra padrao e falar do portfolio Aquafast e do mercado Aquafast, sempre pensando em caixas e nao em unidade avulsa. "
-                    "Se o usuario pedir qualquer dado concreto da base, diga explicitamente que ele deve reformular como pergunta analitica no mesmo chat "
-                    "(ex.: 'top 10 lojas Aquafast por caixa') para o sistema executar SQL no DuckDB. "
-                    "Nao afirme que nao ha acesso aos dados locais da stack quando a pergunta for sobre a base do projeto."
-                ),
-            }
-        ]
-
-        for message in messages:
-            role = message.get("role")
-            if role not in {"user", "assistant"}:
-                continue
-            content = str(message.get("content", "")).strip()
-            if not content:
-                continue
-            chat_messages.append({"role": role, "content": content})
-
-        if not chat_messages or chat_messages[-1].get("role") != "user":
-            chat_messages.append({"role": "user", "content": question})
-
+    async def _classify_intent_with_llm(self, question: str) -> str:
         payload = {
             "model": self.valves.CHAT_MODEL,
-            "messages": chat_messages,
+            "messages": [
+                {"role": "system", "content": INTENT_ROUTER_SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
             "stream": False,
-            "options": {"temperature": 0.2, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
+            "options": {"temperature": 0.0, "num_predict": 12},
         }
-
-        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
+        timeout = min(float(self.valves.OLLAMA_TIMEOUT_SECONDS), 10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
 
         message = data.get("message", {}) if isinstance(data, dict) else {}
-        content = str(message.get("content", "")).strip()
-        if not content:
-            return "Nao consegui gerar uma resposta agora."
-        return content
+        content = self._normalize_text(str(message.get("content", "")).strip())
+        category = content.split()[0] if content else "fora_de_contexto"
+        valid = {
+            "top_produtos",
+            "top_clientes",
+            "ranking_redes",
+            "receita_total",
+            "lojas_hoje",
+            "market_share",
+            "concorrentes_por_categoria",
+            "oportunidades",
+            "evolucao_mensal",
+            "resumo_geral",
+            "fora_de_contexto",
+        }
+        return category if category in valid else "fora_de_contexto"
+
+    async def _format_with_llm(self, question: str, data: dict[str, Any]) -> str:
+        payload_data = {
+            "title": data.get("title"),
+            "route": data.get("route"),
+            "group": data.get("group"),
+            "intent": data.get("intent"),
+            "columns": data.get("columns", []),
+            "rows": data.get("rows", []),
+            "row_count": data.get("row_count", 0),
+            "markdown": data.get("markdown", ""),
+        }
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": FORMAT_WITH_LLM_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": FORMAT_WITH_LLM_USER_PROMPT_TEMPLATE.format(
+                        question=question,
+                        data=json.dumps(payload_data, ensure_ascii=False),
+                    ),
+                },
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
+        }
+        timeout = min(float(self.valves.OLLAMA_TIMEOUT_SECONDS), 10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+                response.raise_for_status()
+                data = response.json()
+            message = data.get("message", {}) if isinstance(data, dict) else {}
+            content = str(message.get("content", "")).strip()
+            return content or ""
+        except Exception:
+            return ""
 
     def _http_status_error_message(self, exc: httpx.HTTPStatusError) -> str:
         detail = ""
+        request_url = ""
         if exc.response is not None:
             try:
                 detail = exc.response.text.strip()
             except Exception:
                 detail = ""
+            try:
+                request_url = str(exc.request.url)
+            except Exception:
+                request_url = ""
         if len(detail) > 800:
             detail = detail[:797] + "..."
         code = exc.response.status_code if exc.response is not None else "?"
-        return repair_mojibake(
+        lower_detail = detail.lower()
+        lower_url = request_url.lower()
+
+        # Evita spinner infinito quando o fallback depende de modelo Ollama ausente.
+        if code == 404 and ("model" in lower_detail and "not found" in lower_detail):
+            model_name = safe_output_text(getattr(self.valves, "CHAT_MODEL", "")).strip() or "llama3.2:3b"
+            return safe_output_text(
+                "Nao consegui concluir esta consulta porque o modelo de fallback nao esta disponivel no Ollama.\n\n"
+                f"Modelo configurado: `{model_name}`.\n"
+                "A pergunta predefinida continua funcionando via API deterministica, mas para fallback por chat "
+                "e necessario carregar este modelo no Ollama."
+            )
+
+        return safe_output_text(
             f"Erro HTTP {code} na API Aquafast.\n\n"
             f"{detail or '(sem detalhe no corpo da resposta)'}\n\n"
             "Confirme se o servico da API esta no ar, a URL em Valves (ex.: `http://scanntech-api:8000`) "
             "bate com o `docker compose` e se o arquivo `aquafast_scanntech.duckdb` existe no container."
         )
     def _build_analysis_response(self, question: str, result: dict[str, Any], sql_hint: str) -> str:
-        summary = repair_mojibake(self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])))
-        source_note = repair_mojibake(self._source_note_from_result(question, result))
-        markdown = repair_mojibake(result.get("markdown", ""))
+        summary = safe_output_text(self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])))
+        source_note = safe_output_text(self._source_note_from_result(question, result))
+        markdown = safe_output_text(result.get("markdown", ""))
+        history_block = safe_output_text(self._history_block_from_result(question, result))
         cap_note = ""
         if result.get("truncated"):
             cap = result.get("row_cap")
-            cap_note = repair_mojibake(
+            cap_note = safe_output_text(
                 f"\n\n_Amostra limitada pela API ({cap} linhas no maximo). "
                 "Refine a pergunta com filtros (mes, cliente, produto) ou use LIMIT menor no SQL para ver tudo no Excel._"
             )
-        return "\n".join(
+        return self._finalize_output("\n".join(
             [
-                repair_mojibake("## Analise Aquafast"),
+                safe_output_text("## Análise Aquafast"),
                 "",
                 summary,
                 "",
@@ -1393,10 +1710,12 @@ class Pipe:
                 "",
                 markdown,
                 "",
-                repair_mojibake(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                safe_output_text(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                "",
+                history_block,
                 cap_note,
             ]
-        ).strip()
+        ).strip())
     async def _try_legacy_ask(self, question: str) -> str | None:
         """Respostas instantaneas via POST /ask quando a pergunta casa com legacy_question_to_sql na API."""
         base = self.valves.API_BASE_URL.rstrip("/")
@@ -1425,10 +1744,21 @@ class Pipe:
         export: bool = False,
         chart: bool = False,
         sql_override: str | None = None,
+        intent_group: str | None = None,
     ) -> str:
+        started = time.time()
+        group = intent_group or "Insights de Vendas"
         if not export and sql_override is None:
             legacy_reply = await self._try_legacy_ask(question)
             if legacy_reply is not None:
+                self._log_agent_query(
+                    group=group,
+                    route="/ask",
+                    mode="deterministic",
+                    started_at=started,
+                    status="ok",
+                    rows=None,
+                )
                 return legacy_reply
 
         schema = await self._fetch_schema()
@@ -1449,6 +1779,789 @@ class Pipe:
             if export:
                 result = await self._export_sql(sql, "Exportacao Excel")
                 download_url = result.get("download_url", "")
+                self._log_agent_query(
+                    group=group,
+                    route="/export",
+                    mode="deterministic",
+                    started_at=started,
+                    status="ok",
+                    rows=result.get("row_count"),
+                )
+                return "\n".join(
+                    [
+                        "## Exportacao Excel",
+                        "",
+                        "Arquivo Excel gerado com sucesso.",
+                        f"[Baixar o arquivo]({download_url})",
+                        "",
+                        f"_Consulta executada: `{result.get('sql', sql)}`_",
+                        f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                    ]
+                )
+
+            sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+            result = await self._query_sql(sql_for_api, "Analise Aquafast")
+        except httpx.HTTPStatusError as exc:
+            detail = str(exc.response.text) if exc.response is not None else ""
+            if exc.response is not None and exc.response.status_code == 400:
+                try:
+                    repaired_sql = await self._repair_sql(body, question, schema_text, sql, detail)
+                    if export:
+                        result = await self._export_sql(repaired_sql, "Exportacao Excel")
+                        download_url = result.get("download_url", "")
+                        return "\n".join(
+                            [
+                                "## Exportacao Excel",
+                                "",
+                                "Arquivo Excel gerado com sucesso.",
+                                f"[Baixar o arquivo]({download_url})",
+                                "",
+                                f"_Consulta executada: `{result.get('sql', repaired_sql)}`_",
+                                f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                            ]
+                        )
+                    sql = repaired_sql
+                    sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+                    result = await self._query_sql(sql_for_api, "Analise Aquafast")
+                except httpx.TimeoutException:
+                    self._log_agent_query(
+                        group=group,
+                        route="/query",
+                        mode="deterministic",
+                        started_at=started,
+                        status="error",
+                        rows=None,
+                        error="timeout_repair_sql",
+                    )
+                    return (
+                        "Timeout ao corrigir ou reexecutar o SQL (Ollama ou API demorou demais). "
+                        "Tente de novo em instantes; perguntas comuns respondem direto pela API sem LLM."
+                    )
+                except httpx.HTTPStatusError as exc2:
+                    self._log_agent_query(
+                        group=group,
+                        route="/query",
+                        mode="deterministic",
+                        started_at=started,
+                        status="error",
+                        rows=None,
+                        error=f"http_status_{exc2.response.status_code if exc2.response is not None else '?'}",
+                    )
+                    return self._http_status_error_message(exc2)
+                except Exception as fix_exc:
+                    self._log_agent_query(
+                        group=group,
+                        route="/query",
+                        mode="deterministic",
+                        started_at=started,
+                        status="error",
+                        rows=None,
+                        error=type(fix_exc).__name__,
+                    )
+                    fix_msg = str(fix_exc).strip()
+                    if len(fix_msg) > 400:
+                        fix_msg = fix_msg[:397] + "..."
+                    orig = detail.strip()
+                    if len(orig) > 500:
+                        orig = orig[:497] + "..."
+                    return (
+                        "Nao consegui executar a consulta apos tentar corrigir o SQL automaticamente.\n\n"
+                        f"Resposta da API na primeira tentativa: {orig or '(vazio)'}\n\n"
+                        f"Erro na segunda tentativa: {fix_msg}"
+                    )
+            else:
+                self._log_agent_query(
+                    group=group,
+                    route="/query",
+                    mode="deterministic",
+                    started_at=started,
+                    status="error",
+                    rows=None,
+                    error=f"http_status_{exc.response.status_code if exc.response is not None else '?'}",
+                )
+                return self._finalize_output(self._http_status_error_message(exc))
+
+        if export:
+            # defensive fallback; normally handled earlier
+            download_url = result.get("download_url", "")
+            self._log_agent_query(
+                group=group,
+                route="/export",
+                mode="deterministic",
+                started_at=started,
+                status="ok",
+                rows=result.get("row_count"),
+            )
+            return "\n".join(
+                [
+                    "## Exportacao Excel",
+                    "",
+                    "Arquivo Excel gerado com sucesso.",
+                    f"[Baixar o arquivo]({download_url})",
+                    "",
+                    f"_Consulta executada: `{result.get('sql', sql)}`_",
+                    f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                ]
+            )
+
+        self._log_agent_query(
+            group=group,
+            route="/query",
+            mode="deterministic",
+            started_at=started,
+            status="ok",
+            rows=result.get("row_count"),
+        )
+        return self._build_analysis_response(question, result, sql)
+
+    def _render_chart(self, title: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "_Nenhum dado encontrado para montar o grafico._"
+
+        labels = ["cliente", "produto", "mes", "periodo", "categoria", "name"]
+        values = ["valor_total", "receita_total", "receita", "total_vendas", "total_pedidos", "qtd", "quantity"]
+
+        lower_map = {column.lower(): column for column in columns}
+        label_col = next((original for key in labels for lower, original in lower_map.items() if key == lower or key in lower), None)
+        value_col = next((original for key in values for lower, original in lower_map.items() if key == lower or key in lower), None)
+
+        if not label_col and columns:
+            label_col = columns[0]
+        if not value_col and len(columns) > 1:
+            value_col = columns[1]
+
+        if not label_col or not value_col:
+            return "_Nao foi possivel identificar colunas para o grafico._"
+
+        label_idx = columns.index(label_col)
+        value_idx = columns.index(value_col)
+        points = []
+        for row in rows[:12]:
+            label = str(row[label_idx])
+            value = row[value_idx]
+            try:
+                numeric = float(value)
+            except Exception:
+                continue
+            points.append((label, numeric))
+
+        if not points:
+            return "_Nao encontrei valores numericos suficientes para montar o grafico._"
+
+        max_value = max(v for _, v in points)
+        if max_value <= 0:
+            max_value = 1.0
+
+        chart_lines = [
+            "```mermaid",
+            "xychart-beta",
+            f'    title "{title}"',
+            f'    x-axis {json.dumps([label for label, _ in points], ensure_ascii=False)}',
+            f'    y-axis "{value_col}" 0 --> {int(max_value * 1.1) if max_value > 0 else 1}',
+            f"    bar {json.dumps([round(value, 2) for _, value in points], ensure_ascii=False)}",
+            "```",
+        ]
+        return self._finalize_output("\n".join(chart_lines))
+
+    def _answer_available_questions(self) -> str:
+        lines = ["# Perguntas disponíveis", ""]
+        for group in AGENT_GROUPS:
+            label = safe_text(group.get("label") or group.get("title") or "Categoria")
+            lines.append(f"## {label}")
+            for item in group.get("questions", ()):
+                item_text = safe_text(item)
+                if item_text:
+                    lines.append(f"- {item_text}")
+            lines.append("")
+        lines.append("Se preferir, envie uma pergunta direta sobre vendas, produtos, concorrência, oportunidades ou auditoria da base.")
+        return self._finalize_output("\n".join(lines).strip())
+
+    def _find_agent_group(self, question: str) -> dict[str, Any] | None:
+        q = self._normalize_text(question)
+        if not q:
+            return None
+
+        best_group: dict[str, Any] | None = None
+        best_score = 0
+        for group in AGENT_GROUPS:
+            aliases = {
+                self._normalize_text(str(group.get("title", ""))),
+                self._normalize_text(str(group.get("label", ""))),
+            }
+            aliases.update(self._normalize_text(alias) for alias in group.get("aliases", ()))
+            if q in aliases:
+                return group
+            score = 0
+            for kw in GROUP_INTENT_KEYWORDS.get(str(group.get("label", "")), ()):
+                token = self._normalize_text(kw)
+                if token and token in q:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_group = group
+        if best_score > 0:
+            return best_group
+        return None
+
+    def _is_agent_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        if not q:
+            return False
+        if q in {self._normalize_text(g.get("title", "")) for g in AGENT_GROUPS}:
+            return True
+        if q in {self._normalize_text(g.get("label", "")) for g in AGENT_GROUPS}:
+            return True
+        return any(token in q for token in ("agente", "categoria"))
+
+    def _answer_agent_group(self, question: str) -> str:
+        group = self._find_agent_group(question)
+        if group is None:
+            return ""
+        heading = safe_text(group.get("label") or group.get("title") or "Agente") or "Agente"
+        lines = [f"## {heading}", ""]
+        
+        # Add description if available
+        if group.get("description"):
+            lines.append(safe_text(group.get("description")))
+            lines.append("")
+        
+        questions = [
+            safe_text(item)
+            for item in group.get("questions", ())
+        ]
+        for idx, item in enumerate(questions, start=1):
+            if item:
+                lines.append(f"{idx}. {self._inline_prompt(item)}")
+        lines.append("")
+        lines.append(safe_text("Clique em uma pergunta para copiar, cole no campo de mensagem e envie."))
+        lines.append("Ou use `Mostrar perguntas disponíveis` para ver todas as categorias.")
+        return self._finalize_output("\n".join(lines).strip())
+
+    def _intent_group_label(self, question: str) -> str:
+        group = self._find_agent_group(question)
+        if group is None:
+            return "Não reconhecido"
+        return safe_text(group.get("label") or group.get("title") or "Não reconhecido")
+
+    def _out_of_scope_guidance(self) -> str:
+        return (
+            "Posso ajudar com vendas, produtos, concorrência, oportunidades ou auditoria da base. "
+            "Tente uma pergunta como: `Quais foram os produtos mais vendidos no último mês?`"
+        )
+
+    def _canonicalize_deterministic_question(self, question: str) -> str:
+        q = self._normalize_text(question)
+        mappings: list[tuple[tuple[str, ...], str]] = [
+            (("ranking de produtos", "produtos mais vendidos", "top produtos"), "Quais foram os produtos mais vendidos no último mês?"),
+            (("ranking de clientes", "clientes que mais compraram", "top clientes"), "Quais clientes mais compraram Aquafast?"),
+            (("evolucao de vendas", "vendas por mes"), "Mostre a evolução de vendas da Aquafast por mês."),
+            (("vendas por estado", "vendas por uf", "melhor desempenho de vendas"), "Quais estados têm melhor desempenho de vendas?"),
+            (("compare a aquafast", "principais concorrentes", "concorrentes"), "Compare a Aquafast com os principais concorrentes."),
+            (("market share", "participacao de mercado", "share"), "Compare a Aquafast com os principais concorrentes."),
+            (("sem subgrupo", "dados inconsistentes", "inconsistencia"), "Mostre os produtos sem SUBGRUPO_CIGAM"),
+            (("oportunidade de crescimento", "potencial de crescimento", "lacuna"), "Quais produtos teriam mais potencial de venda?"),
+            (("resumo executivo", "performance comercial"), "Mostre um resumo executivo da performance comercial."),
+        ]
+        for aliases, canonical in mappings:
+            if any(a in q for a in aliases):
+                return canonical
+        return question
+
+    def _log_agent_query(
+        self,
+        *,
+        group: str,
+        route: str,
+        mode: str,
+        started_at: float,
+        status: str,
+        rows: Any = None,
+        error: str | None = None,
+    ) -> None:
+        duration_ms = int((time.time() - started_at) * 1000)
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "agent": safe_text(group) or "Nao reconhecido",
+            "route": route,
+            "mode": mode,
+            "duration_ms": duration_ms,
+            "status": status,
+            "rows": int(rows) if isinstance(rows, int) else (int(rows) if isinstance(rows, float) else None),
+        }
+        if error:
+            payload["error"] = safe_text(error)[:160]
+
+        candidates = [
+            Path(r"C:\xampp\htdocs\scantech\logs\agent_queries.log"),
+            Path("/workspace/logs/agent_queries.log"),
+            Path("/app/backend/data/logs/agent_queries.log"),
+            Path("/tmp/agent_queries.log"),
+        ]
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        for path in candidates:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                break
+            except Exception:
+                continue
+
+    def _format_metric(self, value: float, metric_col: str | None) -> str:
+        metric = (metric_col or "").lower()
+        if any(k in metric for k in ["receita", "faturamento", "valor_total", "valor total"]):
+            return f"R$ {self._format_ptbr_number(value)}"
+        if value.is_integer():
+            return self._format_ptbr_number(int(value))
+        return self._format_ptbr_number(value)
+
+    def _format_ptbr_number(self, value: float | int) -> str:
+        if isinstance(value, int):
+            return f"{value:,}".replace(",", ".")
+        if float(value).is_integer():
+            return f"{int(value):,}".replace(",", ".")
+        text = f"{float(value):,.2f}"
+        return text.replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def _deterministic_summary(self, question: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "Nenhum resultado encontrado para essa consulta."
+
+        metric_col = self._pick_metric_column(question, columns, rows)
+        label_col = self._pick_label_column(columns, rows, metric_col)
+        if not metric_col or metric_col not in columns:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        metric_idx = columns.index(metric_col)
+        label_idx = columns.index(label_col) if label_col in columns else 0
+
+        if len(rows) == 1:
+            row = rows[0]
+            metric_value = self._as_float(row[metric_idx])
+            if metric_value is not None:
+                formatted = self._format_metric(metric_value, metric_col)
+                if label_col in columns and label_col != metric_col:
+                    label_value = str(row[label_idx])
+                    return f"{label_value}: {formatted}"
+                return f"{metric_col}: {formatted}"
+
+        points = []
+        for row in rows:
+            m = self._as_float(row[metric_idx])
+            if m is None:
+                continue
+            points.append((str(row[label_idx]), m))
+
+        if not points:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        points.sort(key=lambda x: x[1], reverse=True)
+        total = sum(v for _, v in points)
+        top = points[:3]
+        lines = []
+        lines.append(f"Metricas: `{metric_col}` (ordenado desc).")
+        lines.append("Top 3:")
+        for i, (name, v) in enumerate(top, start=1):
+            lines.append(f"{i}. {name} - {self._format_metric(v, metric_col)}")
+        if total > 0 and len(points) >= 3:
+            share = sum(v for _, v in top) / total * 100.0
+            lines.append(f"Participacao do top 3 no total listado: {share:.1f}%")
+        return "\n".join(lines)
+
+    def _source_note_from_result(self, question: str, result: dict[str, Any]) -> str:
+        note = str(result.get("source_note", "") or "").strip()
+        if note:
+            return note
+
+        title = str(result.get("title", "") or "")
+        sql = str(result.get("sql", "") or "")
+        text = self._normalize_text(" ".join([question, title, sql]))
+
+        if "potencial de venda" in text or "maior potencial" in text:
+            return (
+                "Fonte: `top_produtos_categoria`. "
+                "A consulta usa a presenca em PDVs e o volume em caixas como proxy de potencial de venda."
+            )
+        if any(
+            term in text
+            for term in [
+                "lojas com concorrente sem aquafast",
+            ]
+        ):
+            return (
+                "Fonte: `lojas_com_concorrente_sem_aquafast`. "
+                "A consulta usa PDV_ID como chave principal e expÃµe `status_loja` quando a ligaÃƒÂ§ÃƒÂ£o nao existir."
+            )
+        if any(
+            term in text
+            for term in [
+                "concorrentes por categoria",
+                "share aquafast por categoria",
+                "top concorrentes por cidade",
+                "concorrentes em crescimento 90 dias",
+            ]
+        ):
+            return (
+                "Fonte: views deterministicas de concorrencia. "
+                "A consulta usa o universo do mercado carregado e separa Aquafast de concorrentes sem chamar LLM."
+            )
+        if any(term in text for term in ["maior concorrente", "concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
+            return (
+                "Fonte: `ms_mercado_aquafast`. "
+                "A consulta compara os fabricantes do mercado da categoria e exclui a Aquafast para apontar concorrentes."
+            )
+        if any(term in text for term in ["market share", "participacao", "share"]):
+            return (
+                "Fonte: `ms_mercado_aquafast`. "
+                "A consulta mede a participacao de cada fabricante dentro do mercado da categoria."
+            )
+        if any(term in text for term in ["ponto de venda", "pontos de venda", "loja", "lojas", "pdv"]):
+            return (
+                "Fonte: `ranking_clientes`. "
+                "A consulta conta as lojas/PDVs que aparecem com venda Aquafast no periodo carregado."
+            )
+        if any(term in text for term in ["produto por categoria", "categoria", "litragem", "mix"]):
+            return (
+                "Fonte: `top_produtos_categoria`. "
+                "A consulta cruza o portfolio Aquafast com caixas para enxergar o mix por categoria, "
+                "consolidando pelo mapeamento oficial de `SUBGRUPO_CIGAM`."
+            )
+        if any(term in text for term in ["vendas por mes", "vendas por mÃƒÂªs", "mensal", "serie mensal", "sÃƒÂ©rie mensal"]):
+            return (
+                "Fonte: `vendas_por_mes`. "
+                "A consulta consolida caixas e receita ao longo do tempo para mostrar tendencia mensal."
+            )
+        if any(term in text for term in ["vendas por estado", "estado", "uf"]):
+            return (
+                "Fonte: `vendas_caixas_estado`. "
+                "A consulta cruza as vendas Aquafast com a UF para mostrar distribuicao geografica."
+            )
+        if any(term in text for term in ["top produtos", "ranking produtos", "mais vendidos", "receita por produto", "volume de vendas"]):
+            return (
+                "Fonte: `ranking_produtos`. "
+                "A consulta lista os produtos Aquafast com maior volume em caixas e receita, "
+                "consolidando pelo mapeamento oficial de `SUBGRUPO_CIGAM`."
+            )
+        if any(term in text for term in ["subgrupo cigam", "padronizacao", "padronizaÃ§Ã£o", "nao casam com o portfolio", "nao casam com o portifolio"]):
+            return (
+                "Fonte: `auditoria_produtos_sem_subgrupo_cigam`. "
+                "A consulta lista os produtos Aquafast sem correspondencia no portfolio e sugere `SUBGRUPO_CIGAM` apenas quando a similaridade e transparente."
+            )
+        if any(term in text for term in ["historico de consultas", "historico consultas", "ultimas consultas", "quais relatorios eu consultei"]):
+            return (
+                "Fonte: `aquafast_query_history`. "
+                "A consulta mostra as 20 consultas deterministicas mais recentes registradas pelo Scanntech Analyst."
+            )
+        if any(term in text for term in ["clientes", "lojas", "churn", "compra"]):
+            return (
+                "Fonte: `ranking_clientes`. "
+                "A consulta resume as lojas Aquafast por caixas vendidas, receita e recorrencia."
+            )
+        return "Fonte: consulta local no DuckDB usando as views semanticas da Aquafast."
+
+    def _history_block_from_result(self, question: str, result: dict[str, Any]) -> str:
+        report_name = str(result.get("history_report_name", "") or "").strip()
+        timestamp = str(result.get("history_timestamp", "") or "").strip()
+        if not report_name and not timestamp:
+            return ""
+        lines = ["Historico desta consulta:", f"- relatorio: {report_name or 'desconhecido'}", f"- pergunta: {question or ''}"]
+        if timestamp:
+            lines.append(f"- executado em: {timestamp}")
+        return "\n".join(lines)
+
+    def _ensure_select_only(self, sql: str) -> str:
+        normalized = self._normalize_text(sql)
+        if not re.match(r"^(select|with|show|describe)\b", normalized):
+            raise ValueError("SQL gerado nao parece ser uma consulta somente leitura.")
+        return sql.strip().rstrip(";")
+
+    def _wrap_sql_for_safe_rows(self, sql: str, *, for_export: bool) -> str:
+        """
+        Evita SELECT sem LIMIT puxando milhoes de linhas (lento no DuckDB e no chat).
+        Exportacao Excel usa so o teto da API (EXPORT); nao aplica este wrap.
+        """
+        if for_export:
+            return sql.strip().rstrip(";")
+        s = sql.strip().rstrip(";")
+        low = s.lower()
+        if not (low.startswith("select") or low.startswith("with")):
+            return s
+        collapsed = re.sub(r"\s+", " ", low).strip()
+        if re.search(r"\blimit\s+\d+(\s+offset\s+\d+)?\s*$", collapsed):
+            return s
+        cap = max(1, int(self.valves.SQL_SAFETY_ROW_CAP))
+        return f"SELECT * FROM ({s}) AS _aquafast_safe LIMIT {cap}"
+
+    async def _generate_sql(self, body: dict, question: str, schema_text: str, previous_sql: str | None = None) -> str:
+        messages = body.get("messages", [])[-int(self.valves.SQL_CONTEXT_MESSAGES) :]
+        user_context = []
+        for message in messages:
+            role = message.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._content_to_text(message.get("content", ""))
+            if not content:
+                continue
+        # evita mandar tabelas gigantes pro modelo
+            if "| --- |" in content or content.count("\n|") > 5:
+                continue
+            user_context.append(f"{role.upper()}: {content[:600]}")
+        context_text = "\n".join(user_context) if user_context else "sem contexto adicional"
+        previous_sql_text = f"\n\nSQL anterior (para modificar/continuar se fizer sentido):\n```sql\n{previous_sql}\n```" if previous_sql else ""
+
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Voce e um analista de dados especializado no portfolio Aquafast sobre DuckDB. "
+                    "A regra padrao e analisar apenas o mercado Aquafast, usando caixas como base de negocio e evitando a leitura do universo bruto da Scanntech. "
+                    "Para perguntas operacionais de resultado, ranking e evolucao, considere apenas os itens Aquafast (is_aquafast = 1). "
+                    "Use o universo completo da categoria apenas quando a pergunta for explicitamente de concorrencia, market share ou comparacao de mercado. "
+                    "Gere apenas SQL valido e somente leitura. "
+                    "Use apenas tabelas, views e colunas existentes no schema fornecido. "
+                    "Responda com um unico bloco de codigo Markdown ```sql ... ``` e nada mais. "
+                    "Se a pergunta pedir top 20, use LIMIT 20. "
+                    "Sempre termine consultas exploratorias com LIMIT (ex.: 200 ou 500) quando nao houver agregacao que ja reduza o resultado. "
+                    "Prefira as views ranking_clientes, ranking_produtos, vendas_por_mes, ms_mercado_aquafast, vendas_caixas_estado e top_produtos_categoria quando elas atenderem a pergunta. "
+                    "Nao invente colunas. Nao use INSERT, UPDATE, DELETE, DROP ou ALTER."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Schema DuckDB/Aquafast:\n{schema_text}\n\n"
+                    f"Pergunta do usuario: {question}\n\n"
+                    f"Contexto recente:\n{context_text}{previous_sql_text}"
+                ),
+            },
+        ]
+
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": prompt,
+            "stream": False,
+            "options": {"temperature": 0.0, "num_predict": int(self.valves.SQL_MAX_TOKENS)},
+        }
+
+        sql_timeout = min(
+            float(self.valves.OLLAMA_TIMEOUT_SECONDS),
+            float(self.valves.OLLAMA_SQL_TIMEOUT_SECONDS),
+        )
+        async with httpx.AsyncClient(timeout=sql_timeout) as client:
+            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = str(message.get("content", "")).strip()
+        sql = self._extract_sql_block(content)
+        if not sql:
+            raise ValueError("O modelo nao retornou SQL em formato valido.")
+        return self._ensure_select_only(sql)
+
+    async def _repair_sql(self, body: dict, question: str, schema_text: str, bad_sql: str, error_text: str) -> str:
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Voce corrige SQL para DuckDB. Retorne apenas um bloco de codigo Markdown com a consulta corrigida. "
+                        "Use somente leitura."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Schema:\n{schema_text}\n\n"
+                        f"Pergunta: {question}\n\n"
+                        f"SQL com erro:\n```sql\n{bad_sql}\n```\n\n"
+                        f"Erro retornado pelo DuckDB:\n{error_text}"
+                    ),
+                },
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.SQL_MAX_TOKENS)},
+        }
+
+        sql_timeout = min(
+            float(self.valves.OLLAMA_TIMEOUT_SECONDS),
+            float(self.valves.OLLAMA_SQL_TIMEOUT_SECONDS),
+        )
+        async with httpx.AsyncClient(timeout=sql_timeout) as client:
+            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = str(message.get("content", "")).strip()
+        sql = self._extract_sql_block(content)
+        if not sql:
+            raise ValueError("Nao foi possivel corrigir o SQL.")
+        return self._ensure_select_only(sql)
+
+    async def _summarize_result(self, question: str, sql: str, markdown_table: str) -> str:
+        # Para performance, nao envie tabela completa. Use apenas as primeiras linhas.
+        snippet_lines = markdown_table.splitlines()[:14]
+        snippet = "\n".join(snippet_lines)
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                "content": (
+                "Voce e o Aquafast IA. Explique o resultado de forma objetiva, executiva e honesta. "
+                "Nao invente numeros. Use exatamente os valores fornecidos na tabela."
+            ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Pergunta: {question}\n\n"
+                        f"SQL executado:\n```sql\n{sql}\n```\n\n"
+                        f"Resultado (amostra):\n{snippet}\n\n"
+                        "Resuma o que o resultado mostra em portugues, em 3 a 6 linhas, "
+                        "e destaque a principal leitura de negocio."
+                    ),
+                },
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
+        }
+
+        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
+            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = str(message.get("content", "")).strip()
+        return content or "Analise concluida."
+
+    def _http_status_error_message(self, exc: httpx.HTTPStatusError) -> str:
+        detail = ""
+        request_url = ""
+        if exc.response is not None:
+            try:
+                detail = exc.response.text.strip()
+            except Exception:
+                detail = ""
+            try:
+                request_url = str(exc.request.url)
+            except Exception:
+                request_url = ""
+        if len(detail) > 800:
+            detail = detail[:797] + "..."
+        code = exc.response.status_code if exc.response is not None else "?"
+        lower_detail = detail.lower()
+        lower_url = request_url.lower()
+        if code == 404 and ("model" in lower_detail and "not found" in lower_detail):
+            model_name = safe_output_text(getattr(self.valves, "CHAT_MODEL", "")).strip() or "llama3.2:3b"
+            backend_hint = "Ollama" if "11434" in lower_url or "/api/chat" in lower_url else "modelo de fallback"
+            return safe_output_text(
+                f"Nao consegui concluir esta consulta porque o {backend_hint} nao esta disponivel.\n\n"
+                f"Modelo configurado: `{model_name}`.\n"
+                "Perguntas predefinidas continuam funcionando pela API deterministica. "
+                "Para fallback por chat, carregue o modelo no Ollama."
+            )
+        return safe_output_text(
+            f"Erro HTTP {code} na API Aquafast.\n\n"
+            f"{detail or '(sem detalhe no corpo da resposta)'}\n\n"
+            "Confirme se o servico da API esta no ar, a URL em Valves (ex.: `http://scanntech-api:8000`) "
+            "bate com o `docker compose` e se o arquivo `aquafast_scanntech.duckdb` existe no container."
+        )
+    def _build_analysis_response(self, question: str, result: dict[str, Any], sql_hint: str) -> str:
+        summary = safe_output_text(self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])))
+        source_note = safe_output_text(self._source_note_from_result(question, result))
+        markdown = safe_output_text(result.get("markdown", ""))
+        history_block = safe_output_text(self._history_block_from_result(question, result))
+        cap_note = ""
+        if result.get("truncated"):
+            cap = result.get("row_cap")
+            cap_note = safe_output_text(
+                f"\n\n_Amostra limitada pela API ({cap} linhas no maximo). "
+                "Refine a pergunta com filtros (mes, cliente, produto) ou use LIMIT menor no SQL para ver tudo no Excel._"
+            )
+        return self._finalize_output("\n".join(
+            [
+                safe_output_text("## Análise Aquafast"),
+                "",
+                summary,
+                "",
+                source_note,
+                "",
+                markdown,
+                "",
+                safe_output_text(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                "",
+                history_block,
+                cap_note,
+            ]
+        ).strip())
+    async def _try_legacy_ask(self, question: str) -> str | None:
+        """Respostas instantaneas via POST /ask quando a pergunta casa com legacy_question_to_sql na API."""
+        base = self.valves.API_BASE_URL.rstrip("/")
+        url = f"{base}/ask"
+        timeout = min(float(self.valves.LEGACY_ASK_TIMEOUT_SECONDS), float(self.valves.TIMEOUT_SECONDS))
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json={"question": question.strip()})
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        if not data.get("ok"):
+            return None
+        sql_hint = str(data.get("sql", "") or "")
+        return self._build_analysis_response(question, data, sql_hint)
+
+    async def _run_data_pipeline(
+        self,
+        body: dict,
+        question: str,
+        export: bool = False,
+        chart: bool = False,
+        sql_override: str | None = None,
+        intent_group: str | None = None,
+    ) -> str:
+        started = time.time()
+        group = intent_group or self._intent_group_label(question)
+        if not export and sql_override is None:
+            legacy_reply = await self._try_legacy_ask(question)
+            if legacy_reply is not None:
+                self._log_agent_query(group=group, route="/ask", mode="deterministic", started_at=started, status="ok")
+                return legacy_reply
+
+        schema = await self._fetch_schema()
+        schema_text = schema.get("summary_text", "")
+        previous_sql = self._find_last_sql(body)
+        sql = sql_override or await self._generate_sql(body, question, schema_text, previous_sql=previous_sql)
+        validation_error = self._validate_sql_against_question(question, sql)
+        if validation_error:
+            # tenta uma vez regenerar com instrucao extra, sem depender do usuario.
+            sql = await self._generate_sql(
+                body,
+                f"{question}\n\nIMPORTANTE: {validation_error}",
+                schema_text,
+                previous_sql=previous_sql,
+            )
+
+        try:
+            if export:
+                result = await self._export_sql(sql, "Exportacao Excel")
+                download_url = result.get("download_url", "")
+                self._log_agent_query(
+                    group=group,
+                    route="/export",
+                    mode="deterministic",
+                    started_at=started,
+                    status="ok",
+                    rows=result.get("row_count"),
+                )
                 return "\n".join(
                     [
                         "## Exportacao Excel",
@@ -1505,11 +2618,27 @@ class Pipe:
                         f"Erro na segunda tentativa: {fix_msg}"
                     )
             else:
-                return self._http_status_error_message(exc)
+                self._log_agent_query(
+                    group=group,
+                    route="/query",
+                    mode="deterministic",
+                    started_at=started,
+                    status="error",
+                    error=f"http_status_{exc.response.status_code if exc.response is not None else '?'}",
+                )
+                return self._finalize_output(self._http_status_error_message(exc))
 
         if export:
             # defensive fallback; normally handled earlier
             download_url = result.get("download_url", "")
+            self._log_agent_query(
+                group=group,
+                route="/export",
+                mode="deterministic",
+                started_at=started,
+                status="ok",
+                rows=result.get("row_count"),
+            )
             return "\n".join(
                 [
                     "## Exportacao Excel",
@@ -1522,6 +2651,14 @@ class Pipe:
                 ]
             )
 
+        self._log_agent_query(
+            group=group,
+            route="/query",
+            mode="deterministic",
+            started_at=started,
+            status="ok",
+            rows=result.get("row_count"),
+        )
         return self._build_analysis_response(question, result, sql)
 
     def _render_chart(self, title: str, columns: list[str], rows: list[list[Any]]) -> str:
@@ -1571,10 +2708,887 @@ class Pipe:
             f"    bar {json.dumps([round(value, 2) for _, value in points], ensure_ascii=False)}",
             "```",
         ]
-        return "\n".join(chart_lines)
+        return self._finalize_output("\n".join(chart_lines))
 
     def _answer_available_questions(self) -> str:
-        return self._format_questions_block(limit=None)
+        lines = ["# Perguntas disponíveis", ""]
+        for group in AGENT_GROUPS:
+            label = safe_text(group.get("label") or group.get("title") or "Categoria")
+            lines.append(f"## {label}")
+            for item in group.get("questions", ()):
+                item_text = safe_text(item)
+                if item_text:
+                    lines.append(f"- {item_text}")
+            lines.append("")
+        return self._finalize_output("\n".join(lines).strip())
+
+    def _find_agent_group(self, question: str) -> dict[str, Any] | None:
+        q = self._normalize_text(question)
+        if not q:
+            return None
+        best_group = None
+        best_score = 0
+        for group in AGENT_GROUPS:
+            aliases = {
+                self._normalize_text(str(group.get("title", ""))),
+                self._normalize_text(str(group.get("label", ""))),
+            }
+            aliases.update(self._normalize_text(alias) for alias in group.get("aliases", ()))
+            if q in aliases:
+                return group
+            score = 0
+            for kw in GROUP_INTENT_KEYWORDS.get(str(group.get("label", "")), ()):
+                token = self._normalize_text(kw)
+                if token and token in q:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_group = group
+        return best_group if best_score > 0 else None
+
+    def _is_agent_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        if not q:
+            return False
+        if q in {self._normalize_text(g.get("title", "")) for g in AGENT_GROUPS}:
+            return True
+        if q in {self._normalize_text(g.get("label", "")) for g in AGENT_GROUPS}:
+            return True
+        return any(token in q for token in ("agente", "categoria"))
+
+    def _answer_agent_group(self, question: str) -> str:
+        group = self._find_agent_group(question)
+        if group is None:
+            return ""
+        heading = safe_text(group.get("label") or group.get("title") or "Agente") or "Agente"
+        lines = [f"## {heading}", ""]
+        
+        # Add description if available
+        if group.get("description"):
+            lines.append(safe_text(group.get("description")))
+            lines.append("")
+        
+        questions = [
+            safe_text(item)
+            for item in group.get("questions", ())
+        ]
+        for idx, item in enumerate(questions, start=1):
+            if item:
+                lines.append(f"{idx}. {self._inline_prompt(item)}")
+        lines.append("")
+        lines.append(safe_text("Clique em uma pergunta para copiar, cole no campo de mensagem e envie."))
+        lines.append("Ou use `Mostrar perguntas disponíveis`.")
+        return self._finalize_output("\n".join(lines).strip())
+
+    def _intent_group_label(self, question: str) -> str:
+        group = self._find_agent_group(question)
+        if group is None:
+            return "Não reconhecido"
+        return safe_text(group.get("label") or group.get("title") or "Não reconhecido")
+
+    def _out_of_scope_guidance(self) -> str:
+        return (
+            "Posso ajudar com vendas, produtos, concorrência, oportunidades ou auditoria da base. "
+            "Tente uma pergunta como: `Quais foram os produtos mais vendidos no último mês?`"
+        )
+
+    def _canonicalize_deterministic_question(self, question: str) -> str:
+        q = self._normalize_text(question)
+        mappings = [
+            (("ranking de produtos", "produtos mais vendidos", "top produtos"), "Quais foram os produtos mais vendidos no último mês?"),
+            (("ranking de clientes", "clientes que mais compraram", "top clientes"), "Quais clientes mais compraram Aquafast?"),
+            (("evolucao de vendas", "vendas por mes"), "Mostre a evolução de vendas da Aquafast por mês."),
+            (("vendas por estado", "vendas por uf", "melhor desempenho de vendas"), "Quais estados têm melhor desempenho de vendas?"),
+            (("compare a aquafast", "principais concorrentes", "concorrentes"), "Compare a Aquafast com os principais concorrentes."),
+            (("market share", "participacao de mercado", "share"), "Compare a Aquafast com os principais concorrentes."),
+            (("sem subgrupo", "dados inconsistentes", "inconsistencia"), "Existem produtos sem subgrupo ou com dados inconsistentes?"),
+            (("oportunidade de crescimento", "potencial de crescimento", "lacuna"), "Quais produtos têm maior oportunidade de crescimento?"),
+            (("resumo executivo", "performance comercial"), "Mostre um resumo executivo da performance comercial."),
+        ]
+        for aliases, canonical in mappings:
+            if any(a in q for a in aliases):
+                return canonical
+        return question
+
+    def _log_agent_query(
+        self,
+        *,
+        group: str,
+        route: str,
+        mode: str,
+        started_at: float,
+        status: str,
+        rows: Any = None,
+        error: str | None = None,
+    ) -> None:
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "agent": safe_text(group) or "Nao reconhecido",
+            "route": route,
+            "mode": mode,
+            "duration_ms": int((time.time() - started_at) * 1000),
+            "status": status,
+            "rows": int(rows) if isinstance(rows, int) else (int(rows) if isinstance(rows, float) else None),
+        }
+        if error:
+            payload["error"] = safe_text(error)[:160]
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        for path in (
+            Path("/workspace/logs/agent_queries.log"),
+            Path("/app/backend/data/logs/agent_queries.log"),
+            Path("/app/backend/logs/agent_queries.log"),
+            Path("/tmp/agent_queries.log"),
+            Path(r"C:\xampp\htdocs\scantech\logs\agent_queries.log"),
+        ):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                break
+            except Exception:
+                continue
+
+    def _format_metric(self, value: float, metric_col: str | None) -> str:
+        metric = (metric_col or "").lower()
+        if any(k in metric for k in ["receita", "faturamento", "valor_total", "valor total"]):
+            return f"R$ {self._format_ptbr_number(value)}"
+        if value.is_integer():
+            return self._format_ptbr_number(int(value))
+        return self._format_ptbr_number(value)
+
+    def _format_ptbr_number(self, value: float | int) -> str:
+        if isinstance(value, int):
+            return f"{value:,}".replace(",", ".")
+        if float(value).is_integer():
+            return f"{int(value):,}".replace(",", ".")
+        text = f"{float(value):,.2f}"
+        return text.replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def _deterministic_summary(self, question: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "Nenhum resultado encontrado para essa consulta."
+
+        metric_col = self._pick_metric_column(question, columns, rows)
+        label_col = self._pick_label_column(columns, rows, metric_col)
+        if not metric_col or metric_col not in columns:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        metric_idx = columns.index(metric_col)
+        label_idx = columns.index(label_col) if label_col in columns else 0
+
+        if len(rows) == 1:
+            row = rows[0]
+            metric_value = self._as_float(row[metric_idx])
+            if metric_value is not None:
+                formatted = self._format_metric(metric_value, metric_col)
+                if label_col in columns and label_col != metric_col:
+                    label_value = str(row[label_idx])
+                    return f"{label_value}: {formatted}"
+                return f"{metric_col}: {formatted}"
+
+        points = []
+        for row in rows:
+            m = self._as_float(row[metric_idx])
+            if m is None:
+                continue
+            points.append((str(row[label_idx]), m))
+
+        if not points:
+            return "Resultado retornado. Veja a tabela abaixo."
+
+        points.sort(key=lambda x: x[1], reverse=True)
+        total = sum(v for _, v in points)
+        top = points[:3]
+        lines = []
+        lines.append(f"Metricas: `{metric_col}` (ordenado desc).")
+        lines.append("Top 3:")
+        for i, (name, v) in enumerate(top, start=1):
+            lines.append(f"{i}. {name} - {self._format_metric(v, metric_col)}")
+        if total > 0 and len(points) >= 3:
+            share = sum(v for _, v in top) / total * 100.0
+            lines.append(f"Participacao do top 3 no total listado: {share:.1f}%")
+        return "\n".join(lines)
+
+    def _source_note_from_result(self, question: str, result: dict[str, Any]) -> str:
+        note = str(result.get("source_note", "") or "").strip()
+        if note:
+            return note
+
+        title = str(result.get("title", "") or "")
+        sql = str(result.get("sql", "") or "")
+        text = self._normalize_text(" ".join([question, title, sql]))
+
+        if "potencial de venda" in text or "maior potencial" in text:
+            return (
+                "Fonte: `top_produtos_categoria`. "
+                "A consulta usa a presenca em PDVs e o volume em caixas como proxy de potencial de venda."
+            )
+        if any(
+            term in text
+            for term in [
+                "lojas com concorrente sem aquafast",
+            ]
+        ):
+            return (
+                "Fonte: `lojas_com_concorrente_sem_aquafast`. "
+                "A consulta usa PDV_ID como chave principal e expÃµe `status_loja` quando a ligaÃƒÂ§ÃƒÂ£o nao existir."
+            )
+        if any(
+            term in text
+            for term in [
+                "concorrentes por categoria",
+                "share aquafast por categoria",
+                "top concorrentes por cidade",
+                "concorrentes em crescimento 90 dias",
+            ]
+        ):
+            return (
+                "Fonte: views deterministicas de concorrencia. "
+                "A consulta usa o universo do mercado carregado e separa Aquafast de concorrentes sem chamar LLM."
+            )
+        if any(term in text for term in ["maior concorrente", "concorrente", "concorrentes", "concorrencia", "competidor", "competidores"]):
+            return (
+                "Fonte: `ms_mercado_aquafast`. "
+                "A consulta compara os fabricantes do mercado da categoria e exclui a Aquafast para apontar concorrentes."
+            )
+        if any(term in text for term in ["market share", "participacao", "share"]):
+            return (
+                "Fonte: `ms_mercado_aquafast`. "
+                "A consulta mede a participacao de cada fabricante dentro do mercado da categoria."
+            )
+        if any(term in text for term in ["ponto de venda", "pontos de venda", "loja", "lojas", "pdv"]):
+            return (
+                "Fonte: `ranking_clientes`. "
+                "A consulta conta as lojas/PDVs que aparecem com venda Aquafast no periodo carregado."
+            )
+        if any(term in text for term in ["produto por categoria", "categoria", "litragem", "mix"]):
+            return (
+                "Fonte: `top_produtos_categoria`. "
+                "A consulta cruza o portfolio Aquafast com caixas para enxergar o mix por categoria, "
+                "consolidando pelo mapeamento oficial de `SUBGRUPO_CIGAM`."
+            )
+        if any(term in text for term in ["vendas por mes", "vendas por mÃƒÂªs", "mensal", "serie mensal", "sÃƒÂ©rie mensal"]):
+            return (
+                "Fonte: `vendas_por_mes`. "
+                "A consulta consolida caixas e receita ao longo do tempo para mostrar tendencia mensal."
+            )
+        if any(term in text for term in ["vendas por estado", "estado", "uf"]):
+            return (
+                "Fonte: `vendas_caixas_estado`. "
+                "A consulta cruza as vendas Aquafast com a UF para mostrar distribuicao geografica."
+            )
+        if any(term in text for term in ["top produtos", "ranking produtos", "mais vendidos", "receita por produto", "volume de vendas"]):
+            return (
+                "Fonte: `ranking_produtos`. "
+                "A consulta lista os produtos Aquafast com maior volume em caixas e receita, "
+                "consolidando pelo mapeamento oficial de `SUBGRUPO_CIGAM`."
+            )
+        if any(term in text for term in ["subgrupo cigam", "padronizacao", "padronizaÃ§Ã£o", "nao casam com o portfolio", "nao casam com o portifolio"]):
+            return (
+                "Fonte: `auditoria_produtos_sem_subgrupo_cigam`. "
+                "A consulta lista os produtos Aquafast sem correspondencia no portfolio e sugere `SUBGRUPO_CIGAM` apenas quando a similaridade e transparente."
+            )
+        if any(term in text for term in ["historico de consultas", "historico consultas", "ultimas consultas", "quais relatorios eu consultei"]):
+            return (
+                "Fonte: `aquafast_query_history`. "
+                "A consulta mostra as 20 consultas deterministicas mais recentes registradas pelo Scanntech Analyst."
+            )
+        if any(term in text for term in ["clientes", "lojas", "churn", "compra"]):
+            return (
+                "Fonte: `ranking_clientes`. "
+                "A consulta resume as lojas Aquafast por caixas vendidas, receita e recorrencia."
+            )
+        return "Fonte: consulta local no DuckDB usando as views semanticas da Aquafast."
+
+    def _history_block_from_result(self, question: str, result: dict[str, Any]) -> str:
+        report_name = str(result.get("history_report_name", "") or "").strip()
+        timestamp = str(result.get("history_timestamp", "") or "").strip()
+        if not report_name and not timestamp:
+            return ""
+        lines = ["Historico desta consulta:", f"- relatorio: {report_name or 'desconhecido'}", f"- pergunta: {question or ''}"]
+        if timestamp:
+            lines.append(f"- executado em: {timestamp}")
+        return "\n".join(lines)
+
+    def _ensure_select_only(self, sql: str) -> str:
+        normalized = self._normalize_text(sql)
+        if not re.match(r"^(select|with|show|describe)\b", normalized):
+            raise ValueError("SQL gerado nao parece ser uma consulta somente leitura.")
+        return sql.strip().rstrip(";")
+
+    def _wrap_sql_for_safe_rows(self, sql: str, *, for_export: bool) -> str:
+        """
+        Evita SELECT sem LIMIT puxando milhoes de linhas (lento no DuckDB e no chat).
+        Exportacao Excel usa so o teto da API (EXPORT); nao aplica este wrap.
+        """
+        if for_export:
+            return sql.strip().rstrip(";")
+        s = sql.strip().rstrip(";")
+        low = s.lower()
+        if not (low.startswith("select") or low.startswith("with")):
+            return s
+        collapsed = re.sub(r"\s+", " ", low).strip()
+        if re.search(r"\blimit\s+\d+(\s+offset\s+\d+)?\s*$", collapsed):
+            return s
+        cap = max(1, int(self.valves.SQL_SAFETY_ROW_CAP))
+        return f"SELECT * FROM ({s}) AS _aquafast_safe LIMIT {cap}"
+
+    async def _generate_sql(self, body: dict, question: str, schema_text: str, previous_sql: str | None = None) -> str:
+        messages = body.get("messages", [])[-int(self.valves.SQL_CONTEXT_MESSAGES) :]
+        user_context = []
+        for message in messages:
+            role = message.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._content_to_text(message.get("content", ""))
+            if not content:
+                continue
+        # evita mandar tabelas gigantes pro modelo
+            if "| --- |" in content or content.count("\n|") > 5:
+                continue
+            user_context.append(f"{role.upper()}: {content[:600]}")
+        context_text = "\n".join(user_context) if user_context else "sem contexto adicional"
+        previous_sql_text = f"\n\nSQL anterior (para modificar/continuar se fizer sentido):\n```sql\n{previous_sql}\n```" if previous_sql else ""
+
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Voce e um analista de dados especializado no portfolio Aquafast sobre DuckDB. "
+                    "A regra padrao e analisar apenas o mercado Aquafast, usando caixas como base de negocio e evitando a leitura do universo bruto da Scanntech. "
+                    "Para perguntas operacionais de resultado, ranking e evolucao, considere apenas os itens Aquafast (is_aquafast = 1). "
+                    "Use o universo completo da categoria apenas quando a pergunta for explicitamente de concorrencia, market share ou comparacao de mercado. "
+                    "Gere apenas SQL valido e somente leitura. "
+                    "Use apenas tabelas, views e colunas existentes no schema fornecido. "
+                    "Responda com um unico bloco de codigo Markdown ```sql ... ``` e nada mais. "
+                    "Se a pergunta pedir top 20, use LIMIT 20. "
+                    "Sempre termine consultas exploratorias com LIMIT (ex.: 200 ou 500) quando nao houver agregacao que ja reduza o resultado. "
+                    "Prefira as views ranking_clientes, ranking_produtos, vendas_por_mes, ms_mercado_aquafast, vendas_caixas_estado e top_produtos_categoria quando elas atenderem a pergunta. "
+                    "Nao invente colunas. Nao use INSERT, UPDATE, DELETE, DROP ou ALTER."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Schema DuckDB/Aquafast:\n{schema_text}\n\n"
+                    f"Pergunta do usuario: {question}\n\n"
+                    f"Contexto recente:\n{context_text}{previous_sql_text}"
+                ),
+            },
+        ]
+
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": prompt,
+            "stream": False,
+            "options": {"temperature": 0.0, "num_predict": int(self.valves.SQL_MAX_TOKENS)},
+        }
+
+        sql_timeout = min(
+            float(self.valves.OLLAMA_TIMEOUT_SECONDS),
+            float(self.valves.OLLAMA_SQL_TIMEOUT_SECONDS),
+        )
+        async with httpx.AsyncClient(timeout=sql_timeout) as client:
+            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = str(message.get("content", "")).strip()
+        sql = self._extract_sql_block(content)
+        if not sql:
+            raise ValueError("O modelo nao retornou SQL em formato valido.")
+        return self._ensure_select_only(sql)
+
+    async def _repair_sql(self, body: dict, question: str, schema_text: str, bad_sql: str, error_text: str) -> str:
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Voce corrige SQL para DuckDB. Retorne apenas um bloco de codigo Markdown com a consulta corrigida. "
+                        "Use somente leitura."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Schema:\n{schema_text}\n\n"
+                        f"Pergunta: {question}\n\n"
+                        f"SQL com erro:\n```sql\n{bad_sql}\n```\n\n"
+                        f"Erro retornado pelo DuckDB:\n{error_text}"
+                    ),
+                },
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.SQL_MAX_TOKENS)},
+        }
+
+        sql_timeout = min(
+            float(self.valves.OLLAMA_TIMEOUT_SECONDS),
+            float(self.valves.OLLAMA_SQL_TIMEOUT_SECONDS),
+        )
+        async with httpx.AsyncClient(timeout=sql_timeout) as client:
+            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = str(message.get("content", "")).strip()
+        sql = self._extract_sql_block(content)
+        if not sql:
+            raise ValueError("Nao foi possivel corrigir o SQL.")
+        return self._ensure_select_only(sql)
+
+    async def _summarize_result(self, question: str, sql: str, markdown_table: str) -> str:
+        # Para performance, nao envie tabela completa. Use apenas as primeiras linhas.
+        snippet_lines = markdown_table.splitlines()[:14]
+        snippet = "\n".join(snippet_lines)
+        payload = {
+            "model": self.valves.CHAT_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                "content": (
+                "Voce e o Aquafast IA. Explique o resultado de forma objetiva, executiva e honesta. "
+                "Nao invente numeros. Use exatamente os valores fornecidos na tabela."
+            ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Pergunta: {question}\n\n"
+                        f"SQL executado:\n```sql\n{sql}\n```\n\n"
+                        f"Resultado (amostra):\n{snippet}\n\n"
+                        "Resuma o que o resultado mostra em portugues, em 3 a 6 linhas, "
+                        "e destaque a principal leitura de negocio."
+                    ),
+                },
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": int(self.valves.MAX_MODEL_TOKENS)},
+        }
+
+        async with httpx.AsyncClient(timeout=self.valves.OLLAMA_TIMEOUT_SECONDS) as client:
+            response = await client.post(f"{self.valves.OLLAMA_BASE_URL}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        message = data.get("message", {}) if isinstance(data, dict) else {}
+        content = str(message.get("content", "")).strip()
+        return content or "Analise concluida."
+
+    def _http_status_error_message(self, exc: httpx.HTTPStatusError) -> str:
+        detail = ""
+        request_url = ""
+        if exc.response is not None:
+            try:
+                detail = exc.response.text.strip()
+            except Exception:
+                detail = ""
+            try:
+                request_url = str(exc.request.url)
+            except Exception:
+                request_url = ""
+        if len(detail) > 800:
+            detail = detail[:797] + "..."
+        code = exc.response.status_code if exc.response is not None else "?"
+        lower_detail = detail.lower()
+        lower_url = request_url.lower()
+        if code == 404 and ("model" in lower_detail and "not found" in lower_detail):
+            model_name = safe_output_text(getattr(self.valves, "CHAT_MODEL", "")).strip() or "llama3.2:3b"
+            backend_hint = "Ollama" if "11434" in lower_url or "/api/chat" in lower_url else "modelo de fallback"
+            return safe_output_text(
+                f"Nao consegui concluir esta consulta porque o {backend_hint} nao esta disponivel.\n\n"
+                f"Modelo configurado: `{model_name}`.\n"
+                "Perguntas predefinidas continuam funcionando pela API deterministica. "
+                "Para fallback por chat, carregue o modelo no Ollama."
+            )
+        return safe_output_text(
+            f"Erro HTTP {code} na API Aquafast.\n\n"
+            f"{detail or '(sem detalhe no corpo da resposta)'}\n\n"
+            "Confirme se o servico da API esta no ar, a URL em Valves (ex.: `http://scanntech-api:8000`) "
+            "bate com o `docker compose` e se o arquivo `aquafast_scanntech.duckdb` existe no container."
+        )
+    def _build_analysis_response(self, question: str, result: dict[str, Any], sql_hint: str) -> str:
+        summary = safe_output_text(self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])))
+        source_note = safe_output_text(self._source_note_from_result(question, result))
+        markdown = safe_output_text(result.get("markdown", ""))
+        history_block = safe_output_text(self._history_block_from_result(question, result))
+        cap_note = ""
+        if result.get("truncated"):
+            cap = result.get("row_cap")
+            cap_note = safe_output_text(
+                f"\n\n_Amostra limitada pela API ({cap} linhas no maximo). "
+                "Refine a pergunta com filtros (mes, cliente, produto) ou use LIMIT menor no SQL para ver tudo no Excel._"
+            )
+        return self._finalize_output("\n".join(
+            [
+                safe_output_text("## Análise Aquafast"),
+                "",
+                summary,
+                "",
+                source_note,
+                "",
+                markdown,
+                "",
+                safe_output_text(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                "",
+                history_block,
+                cap_note,
+            ]
+        ).strip())
+
+    async def _try_legacy_ask(self, question: str) -> str | None:
+        """Respostas instantâneas via POST /ask quando a pergunta casa com legacy_question_to_sql na API."""
+        base = self.valves.API_BASE_URL.rstrip("/")
+        url = f"{base}/ask"
+        timeout = min(float(self.valves.LEGACY_ASK_TIMEOUT_SECONDS), float(self.valves.TIMEOUT_SECONDS))
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json={"question": question.strip()})
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        if not data.get("ok"):
+            return None
+        sql_hint = str(data.get("sql", "") or "")
+        return self._build_analysis_response(question, data, sql_hint)
+
+    async def _run_data_pipeline(
+        self,
+        body: dict,
+        question: str,
+        export: bool = False,
+        chart: bool = False,
+        sql_override: str | None = None,
+        intent_group: str | None = None,
+    ) -> str:
+        started = time.time()
+        group = intent_group or self._intent_group_label(question)
+        if not export and sql_override is None:
+            legacy_reply = await self._try_legacy_ask(question)
+            if legacy_reply is not None:
+                self._log_agent_query(group=group, route="/ask", mode="deterministic", started_at=started, status="ok")
+                return legacy_reply
+
+        schema = await self._fetch_schema()
+        schema_text = schema.get("summary_text", "")
+        previous_sql = self._find_last_sql(body)
+        sql = sql_override or await self._generate_sql(body, question, schema_text, previous_sql=previous_sql)
+        validation_error = self._validate_sql_against_question(question, sql)
+        if validation_error:
+            # tenta uma vez regenerar com instrucao extra, sem depender do usuario.
+            sql = await self._generate_sql(
+                body,
+                f"{question}\n\nIMPORTANTE: {validation_error}",
+                schema_text,
+                previous_sql=previous_sql,
+            )
+
+        try:
+            if export:
+                result = await self._export_sql(sql, "Exportacao Excel")
+                download_url = result.get("download_url", "")
+                self._log_agent_query(
+                    group=group,
+                    route="/export",
+                    mode="deterministic",
+                    started_at=started,
+                    status="ok",
+                    rows=result.get("row_count"),
+                )
+                return "\n".join(
+                    [
+                        "## Exportacao Excel",
+                        "",
+                        "Arquivo Excel gerado com sucesso.",
+                        f"[Baixar o arquivo]({download_url})",
+                        "",
+                        f"_Consulta executada: `{result.get('sql', sql)}`_",
+                        f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                    ]
+                )
+
+            sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+            result = await self._query_sql(sql_for_api, "Analise Aquafast")
+        except httpx.HTTPStatusError as exc:
+            detail = str(exc.response.text) if exc.response is not None else ""
+            if exc.response is not None and exc.response.status_code == 400:
+                try:
+                    repaired_sql = await self._repair_sql(body, question, schema_text, sql, detail)
+                    if export:
+                        result = await self._export_sql(repaired_sql, "Exportacao Excel")
+                        download_url = result.get("download_url", "")
+                        return "\n".join(
+                            [
+                                "## Exportacao Excel",
+                                "",
+                                "Arquivo Excel gerado com sucesso.",
+                                f"[Baixar o arquivo]({download_url})",
+                                "",
+                                f"_Consulta executada: `{result.get('sql', repaired_sql)}`_",
+                                f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                            ]
+                        )
+                    sql = repaired_sql
+                    sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
+                    result = await self._query_sql(sql_for_api, "Analise Aquafast")
+                except httpx.TimeoutException:
+                    return (
+                        "Timeout ao corrigir ou reexecutar o SQL (Ollama ou API demorou demais). "
+                        "Tente de novo em instantes; perguntas comuns respondem direto pela API sem LLM."
+                    )
+                except httpx.HTTPStatusError as exc2:
+                    return self._http_status_error_message(exc2)
+                except Exception as fix_exc:
+                    fix_msg = str(fix_exc).strip()
+                    if len(fix_msg) > 400:
+                        fix_msg = fix_msg[:397] + "..."
+                    orig = detail.strip()
+                    if len(orig) > 500:
+                        orig = orig[:497] + "..."
+                    return (
+                        "Nao consegui executar a consulta apos tentar corrigir o SQL automaticamente.\n\n"
+                        f"Resposta da API na primeira tentativa: {orig or '(vazio)'}\n\n"
+                        f"Erro na segunda tentativa: {fix_msg}"
+                    )
+            else:
+                self._log_agent_query(
+                    group=group,
+                    route="/query",
+                    mode="deterministic",
+                    started_at=started,
+                    status="error",
+                    error=f"http_status_{exc.response.status_code if exc.response is not None else '?'}",
+                )
+                return self._finalize_output(self._http_status_error_message(exc))
+
+        if export:
+            # defensive fallback; normally handled earlier
+            download_url = result.get("download_url", "")
+            self._log_agent_query(
+                group=group,
+                route="/export",
+                mode="deterministic",
+                started_at=started,
+                status="ok",
+                rows=result.get("row_count"),
+            )
+            return "\n".join(
+                [
+                    "## Exportacao Excel",
+                    "",
+                    "Arquivo Excel gerado com sucesso.",
+                    f"[Baixar o arquivo]({download_url})",
+                    "",
+                    f"_Consulta executada: `{result.get('sql', sql)}`_",
+                    f"_Linhas exportadas: {result.get('row_count', 0)}_",
+                ]
+            )
+
+        self._log_agent_query(
+            group=group,
+            route="/query",
+            mode="deterministic",
+            started_at=started,
+            status="ok",
+            rows=result.get("row_count"),
+        )
+        return self._build_analysis_response(question, result, sql)
+
+    def _render_chart(self, title: str, columns: list[str], rows: list[list[Any]]) -> str:
+        if not rows:
+            return "_Nenhum dado encontrado para montar o grafico._"
+
+        labels = ["cliente", "produto", "mes", "periodo", "categoria", "name"]
+        values = ["valor_total", "receita_total", "receita", "total_vendas", "total_pedidos", "qtd", "quantity"]
+
+        lower_map = {column.lower(): column for column in columns}
+        label_col = next((original for key in labels for lower, original in lower_map.items() if key == lower or key in lower), None)
+        value_col = next((original for key in values for lower, original in lower_map.items() if key == lower or key in lower), None)
+
+        if not label_col and columns:
+            label_col = columns[0]
+        if not value_col and len(columns) > 1:
+            value_col = columns[1]
+
+        if not label_col or not value_col:
+            return "_Nao foi possivel identificar colunas para o grafico._"
+
+        label_idx = columns.index(label_col)
+        value_idx = columns.index(value_col)
+        points = []
+        for row in rows[:12]:
+            label = str(row[label_idx])
+            value = row[value_idx]
+            try:
+                numeric = float(value)
+            except Exception:
+                continue
+            points.append((label, numeric))
+
+        if not points:
+            return "_Nao encontrei valores numericos suficientes para montar o grafico._"
+
+        max_value = max(v for _, v in points)
+        if max_value <= 0:
+            max_value = 1.0
+
+        chart_lines = [
+            "```mermaid",
+            "xychart-beta",
+            f'    title "{title}"',
+            f'    x-axis {json.dumps([label for label, _ in points], ensure_ascii=False)}',
+            f'    y-axis "{value_col}" 0 --> {int(max_value * 1.1) if max_value > 0 else 1}',
+            f"    bar {json.dumps([round(value, 2) for _, value in points], ensure_ascii=False)}",
+            "```",
+        ]
+        return self._finalize_output("\n".join(chart_lines))
+
+    def _answer_available_questions(self) -> str:
+        lines = ["# Perguntas disponíveis", ""]
+        for group in AGENT_GROUPS:
+            label = safe_text(group.get("label") or group.get("title") or "Categoria")
+            lines.append(f"## {label}")
+            for item in group.get("questions", ()):
+                item_text = safe_text(item)
+                if item_text:
+                    lines.append(f"- {item_text}")
+            lines.append("")
+        return self._finalize_output("\n".join(lines).strip())
+
+    def _find_agent_group(self, question: str) -> dict[str, Any] | None:
+        q = self._normalize_text(question)
+        if not q:
+            return None
+        best_group = None
+        best_score = 0
+        for group in AGENT_GROUPS:
+            aliases = {
+                self._normalize_text(str(group.get("title", ""))),
+                self._normalize_text(str(group.get("label", ""))),
+            }
+            aliases.update(self._normalize_text(alias) for alias in group.get("aliases", ()))
+            if q in aliases:
+                return group
+            score = 0
+            for kw in GROUP_INTENT_KEYWORDS.get(str(group.get("label", "")), ()):
+                token = self._normalize_text(kw)
+                if token and token in q:
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_group = group
+        return best_group if best_score > 0 else None
+
+    def _is_agent_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        if not q:
+            return False
+        titles = {self._normalize_text(str(g.get("title", ""))) for g in AGENT_GROUPS}
+        labels = {self._normalize_text(str(g.get("label", ""))) for g in AGENT_GROUPS}
+        if q in titles or q in labels:
+            return True
+        return any(token in q for token in ("agente", "categoria"))
+
+    def _answer_agent_group(self, question: str) -> str:
+        group = self._find_agent_group(question)
+        if group is None:
+            return ""
+        heading = safe_text(group.get("label") or group.get("title") or "Agente") or "Agente"
+        lines = [f"## {heading}", ""]
+        
+        # Add description if available
+        if group.get("description"):
+            lines.append(safe_text(group.get("description")))
+            lines.append("")
+        
+        questions = [
+            safe_text(item)
+            for item in group.get("questions", ())
+        ]
+        for idx, item in enumerate(questions, start=1):
+            if item:
+                lines.append(f"{idx}. {self._inline_prompt(item)}")
+        lines.append("")
+        lines.append(safe_text("Clique em uma pergunta para copiar, cole no campo de mensagem e envie."))
+        lines.append("Ou use `Mostrar perguntas disponíveis`.")
+        return self._finalize_output("\n".join(lines).strip())
+
+    def _intent_group_label(self, question: str) -> str:
+        group = self._find_agent_group(question)
+        if group is None:
+            return "Não reconhecido"
+        return safe_text(group.get("label") or group.get("title") or "Não reconhecido")
+
+    def _out_of_scope_guidance(self) -> str:
+        return (
+            "Posso ajudar com vendas, produtos, concorrência, oportunidades ou auditoria da base. "
+            "Tente uma pergunta como: `Quais foram os produtos mais vendidos no último mês?`"
+        )
+
+    def _canonicalize_deterministic_question(self, question: str) -> str:
+        q = self._normalize_text(question)
+        mappings = [
+            (("ranking de produtos", "produtos mais vendidos", "top produtos"), "Quais foram os produtos mais vendidos no último mês?"),
+            (("ranking de clientes", "clientes que mais compraram", "top clientes"), "Quais clientes mais compraram Aquafast?"),
+            (("evolucao de vendas", "vendas por mes"), "Mostre a evolução de vendas da Aquafast por mês."),
+            (("vendas por estado", "vendas por uf", "melhor desempenho de vendas"), "Quais estados têm melhor desempenho de vendas?"),
+            (("compare a aquafast", "principais concorrentes", "concorrentes"), "Compare a Aquafast com os principais concorrentes."),
+            (("market share", "participacao de mercado", "share"), "Compare a Aquafast com os principais concorrentes."),
+            (("sem subgrupo", "dados inconsistentes", "inconsistencia"), "Existem produtos sem subgrupo ou com dados inconsistentes?"),
+            (("oportunidade de crescimento", "potencial de crescimento", "lacuna"), "Quais produtos têm maior oportunidade de crescimento?"),
+            (("resumo executivo", "performance comercial"), "Mostre um resumo executivo da performance comercial."),
+        ]
+        for aliases, canonical in mappings:
+            if any(a in q for a in aliases):
+                return canonical
+        return question
+
+    def _log_agent_query(
+        self,
+        *,
+        group: str,
+        route: str,
+        mode: str,
+        started_at: float,
+        status: str,
+        rows: Any = None,
+        error: str | None = None,
+    ) -> None:
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "agent": safe_text(group) or "Nao reconhecido",
+            "route": route,
+            "mode": mode,
+            "duration_ms": int((time.time() - started_at) * 1000),
+            "status": status,
+            "rows": int(rows) if isinstance(rows, int) else (int(rows) if isinstance(rows, float) else None),
+        }
+        if error:
+            payload["error"] = safe_text(error)[:160]
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        for path in (
+            Path("/workspace/logs/agent_queries.log"),
+            Path("/app/backend/data/logs/agent_queries.log"),
+            Path("/app/backend/logs/agent_queries.log"),
+            Path("/tmp/agent_queries.log"),
+            Path(r"C:\xampp\htdocs\scantech\logs\agent_queries.log"),
+        ):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                break
+            except Exception:
+                continue
 
     def _format_metric(self, value: float, metric_col: str | None) -> str:
         metric = self._normalize_text(metric_col or "")
@@ -1632,11 +3646,40 @@ class Pipe:
             lines.append(f"Participacao do top 3 no total listado: {share:.1f}%")
         return "\n".join(lines)
 
-    def _build_analysis_response(self, question: str, result: dict[str, Any], sql_hint: str) -> str:
-        summary = self._safe_text(
-            self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])),
-            "Resultado retornado. Veja a tabela abaixo.",
+    def _build_analysis_response(
+        self,
+        question: str,
+        result: dict[str, Any],
+        sql_hint: str,
+        summary_override: str | None = None,
+    ) -> str:
+        route = self._safe_text(
+            result.get("route")
+            or result.get("intent")
+            or result.get("report_name")
+            or "",
+            "",
         )
+        result_title = self._safe_text(result.get("title", ""), "")
+        group_label = self._safe_text(result.get("group", ""), "")
+        if self._normalize_text(group_label) == "nao reconhecido":
+            group_label = ""
+        if not group_label:
+            group_label = ROUTE_TO_LABEL.get(route, "")
+        if not group_label:
+            group_label = result_title
+        if not group_label:
+            group_label = self._intent_group_label(question)
+        if self._normalize_text(group_label) == "nao reconhecido":
+            group_label = ROUTE_TO_LABEL.get(route, "") or result_title or "Resultado"
+        if not group_label:
+            group_label = "Resultado"
+        summary = self._safe_text(summary_override, "")
+        if not summary:
+            summary = self._safe_text(
+                self._deterministic_summary(question, result.get("columns", []), result.get("rows", [])),
+                "Resultado retornado. Veja a tabela abaixo.",
+            )
         source_note = self._safe_text(
             self._source_note_from_result(question, result),
             "Fonte: consulta local no DuckDB usando as views semanticas da Aquafast.",
@@ -1645,27 +3688,35 @@ class Pipe:
         cap_note = ""
         if result.get("truncated"):
             cap = result.get("row_cap")
-            cap_note = repair_mojibake(
+            cap_note = safe_output_text(
                 f"\n\n_Amostra limitada pela API ({cap} linhas no maximo). "
                 "Refine a pergunta com filtros (mes, cliente, produto) ou use LIMIT menor no SQL para ver tudo no Excel._"
             )
         questions_block = self._format_questions_block(limit=6)
-        return "\n".join(
+        next_step = (
+            "Próximo passo sugerido: refine com período, UF, cliente ou categoria para uma leitura mais acionável."
+        )
+        return self._finalize_output("\n".join(
             [
-                repair_mojibake("## Analise Aquafast"),
+                safe_output_text(f"## {group_label}"),
                 "",
+                safe_output_text("### Interpretação"),
                 summary,
                 "",
+                safe_output_text("### Fonte/escopo consultado"),
                 source_note,
                 "",
+                safe_output_text("### Resultado em tabela"),
                 markdown,
                 "",
-                repair_mojibake(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
+                safe_output_text(f"_Linhas retornadas: {result.get('row_count', 0)}_"),
                 cap_note,
+                "",
+                safe_output_text(next_step),
                 "",
                 questions_block,
             ]
-        ).strip()
+        ).strip())
 
     def _render_chart(self, title: str, columns: list[str], rows: list[list[Any]]) -> str:
         if not rows:
@@ -1714,21 +3765,22 @@ class Pipe:
             f"    bar {json.dumps([round(value, 2) for _, value in points], ensure_ascii=False)}",
             "```",
         ]
-        return "\n".join(chart_lines)
+        return self._finalize_output("\n".join(chart_lines))
 
     async def pipe(self, body: dict):
+        started = time.time()
         try:
-            # Proteção contra fallback silencioso para modelo base (qwen2.5)
-            # Se o usuário selecionar qwen2.5:latest em vez do pipe Scanntech Analyst,
+            # Proteção contra fallback silencioso para modelo base (llama3.2)
+            # Se o usuário selecionar llama3.2:3b em vez do pipe Scanntech Analyst,
             # isso bloqueará a resposta e instruirá o redirecionamento.
             model_name = body.get("model", "").lower()
             if "qwen" in model_name and "scanntech_analyst" not in model_name and "analyst" not in model_name:
-                return (
+                return self._finalize_output(
                     "⚠️ **ERRO: Modelo incorreto selecionado**\n\n"
-                    "Você selecionou `qwen2.5:latest` em vez de usar o pipe **Scanntech Analyst**.\n\n"
+                    "Você selecionou `llama3.2:3b` em vez de usar o pipe **Scanntech Analyst**.\n\n"
                     "**O que fazer:**\n"
                     "1. Clique no seletor de modelo no topo do chat\n"
-                    "2. Procure por **\"Scanntech Analyst\"** (não por \"qwen2.5\")\n"
+                    "2. Procure por **\"Scanntech Analyst\"** (não por \"llama3.2:3b\")\n"
                     "3. Selecione **\"Scanntech Analyst\"**\n"
                     "4. Envie sua pergunta novamente\n\n"
                     "O Scanntech Analyst é o assistente especializado em análise dos dados Aquafast. "
@@ -1737,37 +3789,199 @@ class Pipe:
 
             question = self._extract_question(body)
             routing_text = question
+            intent_group = self._intent_group_label(routing_text) if routing_text else "Não reconhecido"
             if not question:
-                return "Envie uma pergunta sobre os dados da Aquafast."
+                self._log_agent_query(
+                    group="Não reconhecido",
+                    route="pipe",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output("Envie uma pergunta sobre os dados da Aquafast.")
 
             if self._is_access_question(routing_text):
-                return self._answer_access_question()
+                return self._finalize_output(self._answer_access_question())
+
+            if self._is_agent_request(routing_text):
+                self._log_agent_query(
+                    group=intent_group,
+                    route="agent_group",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(self._answer_agent_group(routing_text))
 
             if self._is_available_questions_request(routing_text):
-                return self._answer_available_questions()
+                self._log_agent_query(
+                    group="Navegação",
+                    route="available_questions",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(self._answer_available_questions())
 
-            if self._is_explicit_chat_question(routing_text):
-                return await self._ask_chat(body, question)
+            route_hint = self._looks_like_data_question(routing_text)
+            if route_hint is False:
+                guidance = self._out_of_scope_guidance()
+                self._log_agent_query(
+                    group="Não reconhecido",
+                    route="out_of_scope",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(guidance)
+
+            route = self._route_for_question(routing_text)
+            if route is None:
+                category = await self._classify_intent_with_llm(routing_text)
+                if category == "fora_de_contexto":
+                    guidance = self._out_of_scope_guidance()
+                    self._log_agent_query(
+                        group="NÃ£o reconhecido",
+                        route="out_of_scope",
+                        mode="guidance",
+                        started_at=started,
+                        status="ok",
+                    )
+                    return self._finalize_output(guidance)
+                route = self._route_for_question(routing_text, category)
+
+            if route is None:
+                guidance = self._out_of_scope_guidance()
+                self._log_agent_query(
+                    group="NÃ£o reconhecido",
+                    route="out_of_scope",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(guidance)
+
+            normalized_question = self._normalize_text(routing_text)
+            if any(term in normalized_question for term in ("sem subgrupo", "subgrupo", "inconsistencia", "divergencia")):
+                self._log_agent_query(
+                    group="Auditoria de Dados",
+                    route="guidance_auditoria",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(
+                    "Posso auditar produtos sem subgrupo e inconsistencias da base.\n\n"
+                    "Para retornar o relatatorio deterministico sem depender de LLM, use uma pergunta como:\n"
+                    "- `Mostre os produtos sem SUBGRUPO_CIGAM`\n"
+                    "- `Auditoria produtos sem padronizacao`"
+                )
+            if any(term in normalized_question for term in ("oportunidade", "potencial", "lacuna", "gap")):
+                self._log_agent_query(
+                    group="Mapa de Oportunidades",
+                    route="guidance_oportunidades",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(
+                    "Posso apoiar o mapeamento de oportunidades com base em volume, receita e cobertura.\n\n"
+                    "Sem modelo LLM ativo, use uma pergunta deterministica como:\n"
+                    "- `Quais foram os produtos mais vendidos no ultimo mes?`\n"
+                    "- `Quais estados tem melhor desempenho de vendas?`\n"
+                    "- `Quais clientes mais compraram Aquafast?`"
+                )
+
+            if self._is_excel_request(routing_text):
+                export_result = await self._export_sql(route.sql, route.title)
+                download_url = export_result.get("download_url", "")
+                return self._finalize_output(
+                    "\n".join(
+                        [
+                            f"## {route.title}",
+                            "",
+                            "Arquivo Excel gerado com sucesso.",
+                            f"[Baixar o arquivo]({download_url})",
+                            "",
+                            f"_Consulta executada: `{export_result.get('sql', route.sql)}`_",
+                            f"_Linhas exportadas: {export_result.get('row_count', 0)}_",
+                        ]
+                    ).strip()
+                )
+
+            if self._is_chart_request(routing_text):
+                result = await self._query_sql(route.sql, route.title)
+                chart = self._render_chart(result.get("title", route.title), result.get("columns", []), result.get("rows", []))
+                return self._finalize_output(
+                    "\n".join(
+                        [
+                            f"## {result.get('title', route.title)}",
+                            "",
+                            chart,
+                            "",
+                            result.get("markdown", ""),
+                            "",
+                            f"_Consulta executada: `{result.get('sql', route.sql)}`_",
+                            f"_Linhas retornadas: {result.get('row_count', 0)}_",
+                        ]
+                    ).strip()
+                )
+
+            result = await self._query_sql(route.sql, route.title)
+            return self._finalize_output(
+                self._build_analysis_response(routing_text, result, route.sql)
+            )
+
+            normalized_question = self._normalize_text(routing_text)
+            if any(term in normalized_question for term in ("sem subgrupo", "subgrupo", "inconsistencia", "divergencia")):
+                self._log_agent_query(
+                    group="Auditoria de Dados",
+                    route="guidance_auditoria",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(
+                    "Posso auditar produtos sem subgrupo e inconsistências da base.\n\n"
+                    "Para retornar o relatório determinístico sem depender de LLM, use uma pergunta como:\n"
+                    "- `Mostre os produtos sem SUBGRUPO_CIGAM`\n"
+                    "- `Auditoria produtos sem padronização`"
+                )
+            if any(term in normalized_question for term in ("oportunidade", "potencial", "lacuna", "gap")):
+                self._log_agent_query(
+                    group="Mapa de Oportunidades",
+                    route="guidance_oportunidades",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(
+                    "Posso apoiar o mapeamento de oportunidades com base em volume, receita e cobertura.\n\n"
+                    "Sem modelo LLM ativo, use uma pergunta determinística como:\n"
+                    "- `Quais foram os produtos mais vendidos no último mês?`\n"
+                    "- `Quais estados têm melhor desempenho de vendas?`\n"
+                    "- `Quais clientes mais compraram Aquafast?`"
+                )
 
             if self._is_excel_request(routing_text):
                 last_sql = self._find_last_sql(body)
-                route_hint = self._looks_like_data_question(routing_text)
                 if not last_sql and route_hint is not True:
-                    return (
+                    return self._finalize_output(
                         "Para gerar Excel, eu preciso de uma consulta de dados antes "
                         "ou de uma pergunta com contexto de vendas, clientes, produtos ou receitas."
                     )
-                return await self._run_data_pipeline(body, question, export=True, sql_override=last_sql)
+                return self._finalize_output(
+                    await self._run_data_pipeline(body, question, export=True, sql_override=last_sql, intent_group=intent_group)
+                )
 
             if self._is_chart_request(routing_text):
                 last_sql = self._find_last_sql(body)
-                route_hint = self._looks_like_data_question(routing_text)
                 if not last_sql and route_hint is not True:
-                    return (
-                        "Para gerar um grafico, eu preciso de uma pergunta analitica antes "
+                    return self._finalize_output(
+                        "Para gerar um gráfico, eu preciso de uma pergunta analítica antes "
                         "ou de uma consulta anterior com dados."
                     )
-                return await self._handle_chart(body, question)
+                return self._finalize_output(await self._handle_chart(body, question))
 
             # Periodo/datas: tenta resolver de forma deterministica usando o ultimo resultado (sem chamar o modelo).
             if self._looks_like_period_question(routing_text):
@@ -1775,7 +3989,6 @@ class Pipe:
                 if last_table:
                     cols, rows = last_table
                     lower = [c.lower() for c in cols]
-                    # pick product/code column
                     pick = None
                     for key in ["codigo", "cod_produto", "produto", "sku"]:
                         for i, c in enumerate(lower):
@@ -1787,10 +4000,12 @@ class Pipe:
                     if pick is not None:
                         products = [r[pick] for r in rows if r and len(r) > pick]
                         sql = self._build_period_sql_for_products(products)
-                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                        return self._finalize_output(
+                            await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                        )
                     # pick month column
                     pick_mes = None
-                    for key in ["mes", "mÃªs"]:
+                    for key in ["mes", "mês"]:
                         for i, c in enumerate(lower):
                             if key == c or key in c:
                                 pick_mes = i
@@ -1800,7 +4015,9 @@ class Pipe:
                     if pick_mes is not None:
                         months = [r[pick_mes] for r in rows if r and len(r) > pick_mes]
                         sql = self._build_clients_sql_for_months(months)
-                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                        return self._finalize_output(
+                            await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                        )
 
             # Follow-up de clientes (ex.: "essas vendas correspondem a quais clientes?") usando o ultimo resultado com meses.
             if self._looks_like_client_question(routing_text):
@@ -1809,7 +4026,7 @@ class Pipe:
                     cols, rows = last_table
                     lower = [c.lower() for c in cols]
                     pick_mes = None
-                    for key in ["mes", "mÃªs"]:
+                    for key in ["mes", "mês"]:
                         for i, c in enumerate(lower):
                             if key == c or key in c:
                                 pick_mes = i
@@ -1819,7 +4036,9 @@ class Pipe:
                     if pick_mes is not None:
                         months = [r[pick_mes] for r in rows if r and len(r) > pick_mes]
                         sql = self._build_clients_sql_for_months(months)
-                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                        return self._finalize_output(
+                            await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                        )
 
             # Follow-up de cidades dos clientes retornados na ultima tabela.
             if self._looks_like_city_question(routing_text):
@@ -1838,7 +4057,9 @@ class Pipe:
                     if pick_cliente is not None:
                         clients = [r[pick_cliente] for r in rows if r and len(r) > pick_cliente]
                         sql = self._build_cities_sql_for_clients(clients)
-                        return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                        return self._finalize_output(
+                            await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                        )
 
             # Follow-up de produto: nome / ticket medio / ultimo valor praticado.
             # Fazemos de forma deterministica usando o ultimo resultado (para nao "inventar" produto).
@@ -1846,43 +4067,92 @@ class Pipe:
                 products = self._extract_product_codes(body, routing_text)
                 if products:
                     sql = self._build_product_names_sql(products)
-                    return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                    return self._finalize_output(
+                        await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                    )
 
             if self._looks_like_ticket_question(routing_text):
                 products = self._extract_product_codes(body, routing_text)
                 if products:
                     sql = self._build_ticket_sql_for_products(products)
-                    return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                    return self._finalize_output(
+                        await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                    )
 
             if self._looks_like_last_sale_question(routing_text):
                 products = self._extract_product_codes(body, routing_text)
                 if products:
                     sql = self._build_last_sale_sql_for_products(products)
-                    return await self._run_data_pipeline(body, question, export=False, sql_override=sql)
+                    return self._finalize_output(
+                        await self._run_data_pipeline(body, question, export=False, sql_override=sql, intent_group=intent_group)
+                    )
 
             route = self._looks_like_data_question(routing_text)
             if route is False:
-                return await self._ask_chat(body, question)
+                guidance = self._out_of_scope_guidance()
+                self._log_agent_query(
+                    group="Não reconhecido",
+                    route="out_of_scope",
+                    mode="guidance",
+                    started_at=started,
+                    status="ok",
+                )
+                return self._finalize_output(guidance)
 
-            return await self._run_data_pipeline(body, question, export=False)
+            canonical_question = self._canonicalize_deterministic_question(question)
+            return self._finalize_output(
+                await self._run_data_pipeline(body, canonical_question, export=False, intent_group=intent_group)
+            )
         except httpx.TimeoutException:
-            return (
+            self._log_agent_query(
+                group="Erro",
+                route="pipe",
+                mode="error",
+                started_at=started,
+                status="error",
+                error="timeout",
+            )
+            return self._finalize_output(
                 "Timeout: Ollama ou a API Aquafast demorou demais. "
                 "Se a pergunta for comum (ranking, vendas por mes, volume), ela deve cair na resposta rapida via API; "
                 "confira se o container da API e o Ollama estao de pe e os Valves de URL/timeout."
             )
         except httpx.HTTPStatusError as exc:
+            self._log_agent_query(
+                group="Erro",
+                route="pipe",
+                mode="error",
+                started_at=started,
+                status="error",
+                error=f"http_status_{exc.response.status_code if exc.response is not None else '?'}",
+            )
             return self._http_status_error_message(exc)
         except httpx.HTTPError as exc:
-            return (
+            self._log_agent_query(
+                group="Erro",
+                route="pipe",
+                mode="error",
+                started_at=started,
+                status="error",
+                error=type(exc).__name__,
+            )
+            return self._finalize_output(
                 f"Erro de rede ao falar com a stack: {type(exc).__name__}: {exc}\n\n"
                 "Verifique URL da API nos Valves do pipe e conectividade entre containers."
             )
         except Exception as exc:
+            self._log_agent_query(
+                group="Erro",
+                route="pipe",
+                mode="error",
+                started_at=started,
+                status="error",
+                error=type(exc).__name__,
+            )
             detail = str(exc).strip()
             if len(detail) > 280:
                 detail = detail[:277] + "..."
-            return (
+            return self._finalize_output(
                 "Opa! Houve um problema ao processar sua pergunta. "
                 f"Detalhe: {detail}\n\n"
                 "Se for SQL invalido ou coluna inexistente, reformule a pergunta ou tente uma das views: "
@@ -1899,7 +4169,7 @@ class Pipe:
         sql_for_api = self._wrap_sql_for_safe_rows(sql, for_export=False)
         result = await self._query_sql(sql_for_api, "Grafico dos dados anteriores")
         chart = self._render_chart(result.get("title", "Grafico dos dados anteriores"), result.get("columns", []), result.get("rows", []))
-        return "\n".join(
+        return self._finalize_output("\n".join(
             [
                 f"## {result.get('title', 'Grafico dos dados anteriores')}",
                 "",
@@ -1910,4 +4180,4 @@ class Pipe:
                 f"_Consulta executada: `{result.get('sql', sql)}`_",
                 f"_Linhas retornadas: {result.get('row_count', 0)}_",
             ]
-        )
+        ).strip())

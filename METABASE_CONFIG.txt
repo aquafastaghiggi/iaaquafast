@@ -1,26 +1,12 @@
 
 # ============================================================
-# INSTRUÇÃO: Conectar Metabase ao DuckDB
-# ============================================================
-#
-# O Metabase não conecta diretamente ao DuckDB.
-# Use uma das opções abaixo:
-#
-# OPÇÃO A (mais simples): 
-#   O script já exportou as views para CSV na pasta ./exports/
-#   No Metabase: Settings > Databases > Add > Upload CSV
-#
-# OPÇÃO B (mais poderoso):
-#   Instale o plugin DuckDB para Metabase:
-#   https://github.com/MotherDuck-Open-Source/metabase-duckdb-driver
-#   Copie o .jar para: metabase_plugins/
-#   Reinicie o Metabase e adicione conexão tipo DuckDB
-#   Path do banco: /metabase-data/aquafast_scanntech.duckdb
-#
-# OPÇÃO C (recomendado para produção):
-#   Use o script query_api.py para criar uma API REST
-#   que o Metabase consome via connector HTTP
+# INSTRUÃ‡ÃƒO: Conectar Metabase ao DuckDB
 # ============================================================
 
-DB_PATH=aquafast_scanntech.duckdb
+DB_PATH=tmp_feb.duckdb
 VIEWS_DISPONIVEIS=ranking_clientes,ranking_produtos,vendas_por_mes
+
+Arquivos exportados:
+- exports/ranking_clientes.csv
+- exports/ranking_produtos.csv
+- exports/vendas_por_mes.csv

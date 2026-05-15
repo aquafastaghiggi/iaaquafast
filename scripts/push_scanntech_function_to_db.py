@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import importlib.util
+import ast
 import py_compile
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -51,17 +50,30 @@ def validate_function_source() -> None:
 
     py_compile.compile(str(FUNCTION_FILE), doraise=True)
 
-    sys.path.insert(0, str(REPO_ROOT))
-    if SEMANTICS_FILE.exists():
-        import aquafast_semantics  # noqa: F401
-
-    spec = importlib.util.spec_from_file_location("openwebui_scanntech_function_validation", FUNCTION_FILE)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Could not create import spec for openwebui_scanntech_function.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if not hasattr(module, "Pipe"):
+    tree = ast.parse(content, filename=str(FUNCTION_FILE))
+    pipe_class = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "Pipe"
+        ),
+        None,
+    )
+    if pipe_class is None:
         raise RuntimeError("Pipe class is missing from openwebui_scanntech_function.py")
+
+    required_methods = {"pipes", "pipe"}
+    methods = {
+        node.name
+        for node in pipe_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing_methods = sorted(required_methods - methods)
+    if missing_methods:
+        raise RuntimeError(
+            "openwebui_scanntech_function.py is missing required Pipe methods: "
+            + ", ".join(missing_methods)
+        )
 
     if not content.lstrip():
         raise RuntimeError("Function file is empty after trimming")
@@ -69,7 +81,13 @@ def validate_function_source() -> None:
 
 def copy_optional_helper() -> None:
     if SEMANTICS_FILE.exists():
-        run(["docker", "cp", str(SEMANTICS_FILE), f"{CONTAINER}:/tmp/aquafast_semantics.py"])
+        try:
+            run(
+                ["docker", "cp", str(SEMANTICS_FILE), f"{CONTAINER}:/tmp/aquafast_semantics.py"],
+                timeout=15,
+            )
+        except (subprocess.TimeoutExpired, RuntimeError) as exc:
+            print(f"WARN: could not copy optional aquafast_semantics.py helper: {exc}")
 
 
 def copy_function_file() -> None:

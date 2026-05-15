@@ -1,13 +1,13 @@
 # ============================================================
-#  AQUAFAST — Stack de IA local para análise Scanntech
-#  Windows 11 · CPU only · Docker Desktop
+#  AQUAFAST ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Stack de IA local para anÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡lise Scanntech
+#  Windows 11 ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· CPU only ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· Docker Desktop
 # ============================================================
 #
-#  Serviços:
-#   - Ollama        → motor de IA local (porta 11434)
-#   - Open WebUI    → interface de chat (porta 3000)
-#   - Metabase      → dashboards visuais (porta 3001)
-#   - PostgreSQL    → banco do Metabase (interno)
+#  ServiÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â§os:
+#   - Ollama        ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ motor de IA local (porta 11434)
+#   - Open WebUI    ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ interface de chat (porta 3000)
+#   - Metabase      ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ dashboards visuais (porta 3001)
+#   - PostgreSQL    ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ banco do Metabase (interno)
 #
 #  Uso:
 #   docker compose up -d
@@ -17,7 +17,7 @@
 services:
 
   # ----------------------------------------------------------
-  #  OLLAMA — motor de IA rodando localmente
+  #  OLLAMA ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â motor de IA rodando localmente
   #  Sem GPU: usa CPU automaticamente
   # ----------------------------------------------------------
   ollama:
@@ -28,9 +28,9 @@ services:
     volumes:
       - ollama_data:/root/.ollama        # modelos ficam salvos aqui
     environment:
-      - OLLAMA_NUM_PARALLEL=1            # 1 requisição por vez (CPU)
-      - OLLAMA_MAX_LOADED_MODELS=1       # 1 modelo na memória
-      - OLLAMA_KEEP_ALIVE=5m             # descarrega modelo após 5min ocioso
+      - OLLAMA_NUM_PARALLEL=1            # 1 requisiÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â£o por vez (CPU)
+      - OLLAMA_MAX_LOADED_MODELS=1       # 1 modelo na memÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³ria
+      - OLLAMA_KEEP_ALIVE=5m             # descarrega modelo apÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³s 5min ocioso
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
@@ -39,30 +39,37 @@ services:
       retries: 5
 
   # ----------------------------------------------------------
-  #  OPEN WEBUI — interface de chat estilo ChatGPT
+  #  OPEN WEBUI ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â interface de chat estilo ChatGPT
   #  Acesso: http://localhost:3000
   # ----------------------------------------------------------
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.9.5
     container_name: aquafast_webui
     ports:
-      - "3000:8080"
+      - "127.0.0.1:3000:8080"
     volumes:
       - webui_data:/app/backend/data
     environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
+      OLLAMA_BASE_URL: http://ollama:11434
       # Leave model filtering disabled until scripts/doctor_openwebui.py reports OK.
-      # - ENABLE_MODEL_FILTER=true
-      # - MODEL_FILTER_LIST=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
-      - WEBUI_SECRET_KEY=aquafast_secret_2026   # troque por uma chave segura
-      - WEBUI_NAME=Aquafast IA                  # nome que aparece na interface
-      # Padrão de trabalho do projeto: manter Scanntech Analyst como porta de entrada.
+      # ENABLE_MODEL_FILTER: "true"
+      # MODEL_FILTER_LIST: ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
+      WEBUI_SECRET_KEY: aquafast_secret_2026   # troque por uma chave segura
+      WEBUI_NAME: Aquafast IA                  # nome que aparece na interface
+      WEBUI_AUTH: "true"
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: X-Forwarded-Email
+      WEBUI_AUTH_TRUSTED_NAME_HEADER: X-Forwarded-Name
+      WEBUI_AUTH_TRUSTED_GROUPS_HEADER: X-Forwarded-Groups
+      WEBUI_URL: http://192.168.8.123:9091/
+      # PadrÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£o de trabalho do projeto: manter Scanntech Analyst como porta de entrada.
       # Observacao: para Pipes/Functions, o Open WebUI usa o id completo "<function_id>.<pipe_id>".
-      - DEFAULT_MODELS=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
-      - DEFAULT_PINNED_MODELS=ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
-      - DEFAULT_PROMPT_SUGGESTIONS=[{"title":["Quantas lojas a Aquafast tem hoje?"],"content":"Quantas lojas a Aquafast tem hoje?"},{"title":["Em quantos pontos de venda a Aquafast está presente hoje?"],"content":"Em quantos pontos de venda a Aquafast está presente hoje?"},{"title":["Qual o maior concorrente da Aquafast?"],"content":"Qual o maior concorrente da Aquafast?"},{"title":["Quais produtos teriam mais potencial de venda?"],"content":"Quais produtos teriam mais potencial de venda?"},{"title":["Top 20 produtos mais vendidos"],"content":"Top 20 produtos Aquafast por caixa"},{"title":["Top 20 clientes por valor"],"content":"Top 20 clientes Aquafast por caixa"},{"title":["Vendas por mês"],"content":"Mostre as vendas da Aquafast por mês"},{"title":["Vendas por estado"],"content":"Mostre as vendas da Aquafast por estado"}]
-      - ENABLE_SIGNUP=true                      # permite o primeiro cadastro
-      - DEFAULT_USER_ROLE=user
+      DEFAULT_MODELS: ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
+      DEFAULT_PINNED_MODELS: ceb51b31-8ecd-401c-b0cb-677a7f0d8ebc.scanntech_analyst
+      # Na home, mostrar somente os 5 agentes principais para evitar truncamento visual.
+      DEFAULT_PROMPT_SUGGESTIONS: >-
+        [{"title":["Agente Vendas Aquafast"],"content":"Agente Vendas Aquafast"},{"title":["Agente Produtos"],"content":"Agente Produtos"},{"title":["Agente ConcorrÃƒÆ’Ã‚Âªncia"],"content":"Agente ConcorrÃƒÆ’Ã‚Âªncia"},{"title":["Agente Oportunidades"],"content":"Agente Oportunidades"},{"title":["Agente Auditoria da Base"],"content":"Agente Auditoria da Base"}]
+      ENABLE_SIGNUP: "false"
+      DEFAULT_USER_ROLE: user
     depends_on:
       ollama:
         condition: service_healthy
@@ -71,7 +78,7 @@ services:
     restart: unless-stopped
 
   # ----------------------------------------------------------
-  #  SCANNTECH API — consulta deterministica ao DuckDB local
+  #  SCANNTECH API ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â consulta deterministica ao DuckDB local
   #  Acesso interno no compose: http://scanntech-api:8000
   # ----------------------------------------------------------
   scanntech-api:
@@ -98,16 +105,22 @@ services:
       retries: 10
 
   # ----------------------------------------------------------
-  #  METABASE — dashboards e gráficos visuais
-  #  Acesso: http://localhost:3001
+  #  METABASE ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â dashboards e grÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ficos visuais
+  #  Acesso: http://localhost:3002
   # ----------------------------------------------------------
   metabase:
-    image: metabase/metabase:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.metabase
+    image: scantech-metabase:latest
     container_name: aquafast_metabase
     ports:
-      - "3001:3000"
+      - "3002:3000"
     volumes:
       - metabase_data:/metabase-data
+      - ./honeysql-shim.jar:/home/metabase/plugins/honeysql-shim.jar
+      - ./duckdb.metabase-driver.jar:/home/metabase/plugins/duckdb.metabase-driver.jar
+      - ./aquafast_scanntech.duckdb:/duckdb/aquafast_scanntech.duckdb:ro
     environment:
       - MB_DB_TYPE=postgres
       - MB_DB_DBNAME=metabase
@@ -115,15 +128,21 @@ services:
       - MB_DB_USER=metabase
       - MB_DB_PASS=metabase_pass_2026
       - MB_DB_HOST=postgres
+      - MB_PLUGINS_DIR=/home/metabase/plugins/
       - JAVA_TIMEZONE=America/Sao_Paulo
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
 
   # ----------------------------------------------------------
-  #  POSTGRESQL — banco interno do Metabase
-  #  (não é o banco dos dados Scanntech — é só pra o Metabase)
+  #  POSTGRESQL ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â banco interno do Metabase
+  #  (nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â£o ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â© o banco dos dados Scanntech ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â© sÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³ pra o Metabase)
   # ----------------------------------------------------------
   postgres:
     image: postgres:15-alpine
@@ -142,10 +161,11 @@ services:
       retries: 5
 
 # ----------------------------------------------------------
-#  VOLUMES persistentes — dados ficam salvos entre reinicializações
+#  VOLUMES persistentes ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â dados ficam salvos entre reinicializaÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â§ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Âµes
 # ----------------------------------------------------------
 volumes:
   ollama_data:
   webui_data:
   postgres_data:
   metabase_data:
+
